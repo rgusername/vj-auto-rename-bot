@@ -1,0 +1,4 @@
+Install dependencies with: python3 -m pip install -r requirements.txt
+Configure the environment using .env.example (never commit actual secrets).
+Start one worker only: python3 bot.py
+The Procfile already defines: worker: python3 bot.py
