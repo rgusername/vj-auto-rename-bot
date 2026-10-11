@@ -355,7 +355,7 @@ class RenameRuntime:
                     value = getattr(send_video, field, None)
                     if value is not None:
                         send_options[field] = value
-                send_options["supports_streaming"] = bool(getattr(send_video, "supports_streaming", False))
+                send_options["supports_streaming"] = bool(getattr(send_video, "supports_streaming", True))
                 has_spoiler = getattr(final_message, "has_media_spoiler", None)
                 if has_spoiler is not None:
                     send_options["has_spoiler"] = bool(has_spoiler)
