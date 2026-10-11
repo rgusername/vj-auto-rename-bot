@@ -246,13 +246,22 @@ class RenameRuntime:
                 continue
             if after_message_id is not None and int(getattr(message, "id", 0)) <= int(after_message_id):
                 continue
-            reply_to_id = getattr(message, "reply_to_message_id", None)
-            if reply_to_id is None:
-                reply = getattr(message, "reply_to_message", None)
-                reply_to_id = getattr(reply, "id", None) if reply else None
+            body = message.text or message.caption or ""
+            if re.search(r"auto[\s-]*delete\s+notice", body, re.IGNORECASE):
+                logger.debug("Ignoring rename-bot auto-delete notice message_id=%s", getattr(message, "id", None))
+                continue
+            reply_to_id = self._reply_to_message_id(message)
             if reply_to_id is not None and reply_to_ids is not None and int(reply_to_id) not in reply_to_ids:
                 continue
             return message
+
+    @staticmethod
+    def _reply_to_message_id(message) -> int | None:
+        reply_to_id = getattr(message, "reply_to_message_id", None)
+        if reply_to_id is None:
+            reply = getattr(message, "reply_to_message", None)
+            reply_to_id = getattr(reply, "id", None) if reply else None
+        return int(reply_to_id) if reply_to_id is not None else None
 
     async def _advance_job_stage(self, source_id: int, message_id: int, expected: str, stage: str, **fields):
         if not await db.advance_job_stage(source_id, message_id, expected, stage, **fields):
@@ -445,16 +454,45 @@ class RenameRuntime:
                 callback_stage = "callback_submitted"
 
             while True:
-                candidate = await self._next_rename_message(
-                    deadline,
-                    after_message_id=int(menu.id),
-                    reply_to_ids={
+                try:
+                    candidate = await self._next_rename_message(deadline, after_message_id=int(menu.id))
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "Timed out waiting for the renamed video/document from the rename bot; auto-delete notices were ignored."
+                    ) from exc
+                if candidate.video or candidate.document:
+                    media = candidate.video or candidate.document
+                    output_filename = getattr(media, "file_name", None)
+                    reply_to_id = self._reply_to_message_id(candidate)
+                    allowed_reply_ids = {
                         int(value)
                         for value in (getattr(menu, "id", None), getattr(filename_reply, "id", None), getattr(sent_media, "id", None))
                         if value is not None
-                    },
-                )
-                if candidate.video or candidate.document:
+                    }
+                    filename_matches = bool(
+                        output_filename
+                        and os.path.basename(output_filename.replace("\\", "/")).casefold()
+                        == os.path.basename(new_filename.replace("\\", "/")).casefold()
+                    )
+                    if reply_to_id is not None and reply_to_id not in allowed_reply_ids and not filename_matches:
+                        logger.warning(
+                            "Ignoring unrelated rename-bot media %s (reply_to=%s) while waiting for %s for source=%s/%s.",
+                            output_filename or "<no filename>",
+                            reply_to_id,
+                            new_filename,
+                            source_id,
+                            source_message_id,
+                        )
+                        continue
+                    if output_filename and not filename_matches and reply_to_id not in allowed_reply_ids:
+                        logger.warning(
+                            "Ignoring rename-bot media with unexpected filename %s while waiting for %s for source=%s/%s.",
+                            output_filename,
+                            new_filename,
+                            source_id,
+                            source_message_id,
+                        )
+                        continue
                     await self._advance_job_stage(
                         source_id,
                         source_message_id,
@@ -557,7 +595,17 @@ class RenameRuntime:
                 rename_bot_message_id=final_message.id,
             )
             # Once publishing begins, interrupted jobs are fenced as failed on restart to avoid blind duplicate sends.
-            sent = await self._publish_result(final_message, int(job["output_channel_id"]), config.get("thumbnail"), new_filename)
+            output_id = int(job["output_channel_id"])
+            try:
+                sent = await self._publish_result(final_message, output_id, config.get("thumbnail"), new_filename)
+            except Exception:
+                logger.exception(
+                    "Failed to upload renamed media to output channel=%s for source=%s/%s.",
+                    output_id,
+                    source_id,
+                    message_id,
+                )
+                raise
             await db.update_job(
                 source_id,
                 message_id,
