@@ -1,7 +1,7 @@
 import io
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from pymongo.errors import DuplicateKeyError
 from PIL import Image
@@ -11,7 +11,7 @@ from plugins.commands import _normalize_thumbnail
 from config import DB_NAME
 from plugins.database import Database
 from plugins.filename_utils import append_username, extract_original_filename
-from plugins.rename_runtime import select_second_inline_button
+from plugins.rename_runtime import RenameRuntime, select_second_inline_button
 
 
 class FilenameTests(unittest.TestCase):
@@ -66,6 +66,24 @@ class KeyboardTests(unittest.TestCase):
         ])
         with self.assertRaises(ValueError):
             select_second_inline_button(markup)
+
+
+class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_connected_session_for_requester_is_reused(self):
+        runtime = RenameRuntime()
+        runtime.user_client = SimpleNamespace(is_connected=True, get_me=AsyncMock(return_value=SimpleNamespace(id=123)))
+        with patch("plugins.rename_runtime.db.get_session", new=AsyncMock()) as get_session:
+            self.assertTrue(await runtime.ensure_user_session(123))
+        get_session.assert_not_awaited()
+        self.assertEqual(runtime.active_session_owner_id, 123)
+
+    async def test_requesters_saved_session_is_restored_without_relogin(self):
+        runtime = RenameRuntime()
+        with patch("plugins.rename_runtime.db.get_session", new=AsyncMock(return_value="saved-session")), patch.object(
+            runtime, "start_user_session", new=AsyncMock(return_value=True)
+        ) as start_session:
+            self.assertTrue(await runtime.ensure_user_session(123))
+        start_session.assert_awaited_once_with("saved-session", owner_id=123)
 
 
 class SessionPreservationTests(unittest.IsolatedAsyncioTestCase):
