@@ -198,7 +198,8 @@ class RenameRuntime:
     async def resume_pending_jobs(self):
         if not self.user_client:
             return
-        async for job in db.get_pending_jobs():
+        pending_jobs = await db.get_pending_jobs()
+        async for job in pending_jobs:
             source_id = int(job["source_channel_id"])
             config = await db.get_channel_config(source_id)
             if not config or not config.get("thumbnail"):
