@@ -85,6 +85,31 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await runtime.ensure_user_session(123))
         start_session.assert_awaited_once_with("saved-session", owner_id=123)
 
+    async def test_pending_jobs_coroutine_is_awaited_before_cursor_iteration(self):
+        class AsyncCursor:
+            def __init__(self, items):
+                self.items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        runtime = RenameRuntime()
+        runtime.user_client = object()
+        cursor = AsyncCursor([{"source_channel_id": -100101, "source_message_id": 42}])
+        with patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=cursor)) as get_pending, patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
+        ), patch.object(runtime, "_launch_job") as launch_job:
+            await runtime.resume_pending_jobs()
+
+        get_pending.assert_awaited_once_with()
+        launch_job.assert_called_once_with((-100101, 42), -100101, 42)
+
 
 class SessionPreservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_original_session_record_is_read_from_users_collection(self):
