@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 
 from config import (
@@ -25,6 +25,10 @@ from plugins.database import db
 from plugins.filename_utils import append_username, extract_original_filename, sanitize_filename
 
 logger = logging.getLogger(__name__)
+_VIDEO_EXTENSIONS = frozenset({
+    ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg",
+    ".ogv", ".ts", ".webm", ".wmv",
+})
 
 
 def select_second_inline_button(markup):
@@ -193,7 +197,10 @@ class RenameRuntime:
             return
         task = asyncio.create_task(self._process_job(source_id, message_id), name=f"rename:{source_id}:{message_id}")
         self._jobs[key] = task
-        task.add_done_callback(lambda _task, job_key=key: self._jobs.pop(job_key, None))
+        task.add_done_callback(
+            lambda completed, job_key=key: self._jobs.pop(job_key, None)
+            if self._jobs.get(job_key) is completed else None
+        )
 
     async def resume_pending_jobs(self):
         if not self.user_client:
@@ -312,46 +319,63 @@ class RenameRuntime:
                     raise RuntimeError(f"Rename bot reported an error: {body[:500]}")
 
     async def _publish_result(self, final_message, output_id: int, thumbnail: bytes | None, expected_filename: str):
+        video_media = final_message.video
+        document_media = final_message.document
+        media = video_media or document_media
+        if media is None:
+            raise RuntimeError("The rename bot did not return a video or document to publish.")
         if not thumbnail:
-            return await self._bounded_flood_retry(final_message.copy, output_id)
-        media = final_message.video or final_message.document
-        filename = sanitize_filename(expected_filename or (media.file_name if media else None) or "renamed_file")
+            raise RuntimeError("No thumbnail is configured; refusing to publish without the configured thumbnail.")
+
+        filename = sanitize_filename(expected_filename or getattr(media, "file_name", None) or "renamed_file")
+        mime_type = (getattr(media, "mime_type", None) or "").lower()
+        extension = os.path.splitext(filename)[1].lower()
+        is_video = bool(video_media) or bool(
+            document_media and (mime_type.startswith("video/") or extension in _VIDEO_EXTENSIONS)
+        )
         with tempfile.TemporaryDirectory(prefix="vjrename-") as tmpdir:
             source_path = os.path.join(tmpdir, filename)
-            try:
-                downloaded = await final_message.download(file_name=source_path)
-            except Exception:
-                logger.exception("Could not download final rename-bot media for thumbnail application; copying the returned file instead.")
-                return await self._bounded_flood_retry(final_message.copy, output_id)
+            downloaded = await final_message.download(file_name=source_path)
             if not downloaded:
-                return await self._bounded_flood_retry(final_message.copy, output_id)
+                raise RuntimeError("Could not download the rename bot's final media for upload.")
             thumb = io.BytesIO(bytes(thumbnail))
             thumb.name = "thumbnail.jpg"
-            caption = final_message.caption
-            try:
-                if final_message.video:
-                    return await self._bounded_flood_retry(
-                        self.user_client.send_video,
-                        output_id,
-                        downloaded,
-                        caption=caption,
-                        thumb=thumb,
-                        file_name=filename,
-                        duration=final_message.video.duration,
-                        width=final_message.video.width,
-                        height=final_message.video.height,
-                    )
-                return await self._bounded_flood_retry(
+            send_options = {
+                "caption": final_message.caption or "",
+                "thumb": thumb,
+                "file_name": filename,
+            }
+            caption_entities = getattr(final_message, "caption_entities", None)
+            if caption_entities:
+                send_options["caption_entities"] = caption_entities
+
+            if is_video:
+                send_video = video_media or document_media
+                for field in ("duration", "width", "height"):
+                    value = getattr(send_video, field, None)
+                    if value is not None:
+                        send_options[field] = value
+                send_options["supports_streaming"] = bool(getattr(send_video, "supports_streaming", False))
+                has_spoiler = getattr(final_message, "has_media_spoiler", None)
+                if has_spoiler is not None:
+                    send_options["has_spoiler"] = bool(has_spoiler)
+                uploaded = await self._bounded_flood_retry(
+                    self.user_client.send_video,
+                    output_id,
+                    downloaded,
+                    **send_options,
+                )
+            else:
+                uploaded = await self._bounded_flood_retry(
                     self.user_client.send_document,
                     output_id,
                     downloaded,
-                    caption=caption,
-                    thumb=thumb,
-                    file_name=filename,
+                    **send_options,
                 )
-            except RPCError:
-                logger.warning("Telegram rejected the custom thumbnail; forwarding returned file without applying that thumbnail.", exc_info=True)
-                return await self._bounded_flood_retry(final_message.copy, output_id)
+
+            if uploaded is None or not getattr(uploaded, "id", None):
+                raise RuntimeError("Telegram did not confirm successful delivery of the renamed media.")
+            return uploaded
 
     async def _process_job(self, source_id: int, message_id: int):
         try:
