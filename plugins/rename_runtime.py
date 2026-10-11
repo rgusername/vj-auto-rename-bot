@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait
+from pyrogram.errors import BotResponseTimeout, FloodWait
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 
 from config import (
@@ -34,13 +34,20 @@ _VIDEO_EXTENSIONS = frozenset({
 def select_second_inline_button(markup):
     """Return the second actual button in row-major keyboard order."""
     keyboard = getattr(markup, "inline_keyboard", None)
-    if not keyboard:
+    if not isinstance(keyboard, (list, tuple)) or not keyboard:
         raise ValueError("Rename bot returned no inline keyboard.")
-    buttons = [button for row in keyboard for button in row]
+    buttons = [
+        button
+        for row in keyboard
+        if isinstance(row, (list, tuple))
+        for button in row
+        if button is not None
+    ]
     if len(buttons) < 2:
         raise ValueError("Rename bot returned fewer than two inline buttons.")
     button = buttons[1]
-    if not getattr(button, "callback_data", None):
+    callback_data = getattr(button, "callback_data", None)
+    if not isinstance(callback_data, str) or not callback_data:
         raise ValueError("The second inline button has no callback data; it cannot be clicked safely.")
     return button
 
@@ -222,15 +229,39 @@ class RenameRuntime:
             task.cancel()
         return True
 
-    async def _next_rename_message(self, deadline: float):
+    async def _next_rename_message(
+        self,
+        deadline: float,
+        *,
+        after_message_id: int | None = None,
+        reply_to_ids: set[int] | None = None,
+    ):
         loop = asyncio.get_running_loop()
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError("Timed out waiting for the rename bot.")
             message = await asyncio.wait_for(self._rename_messages.get(), timeout=remaining)
-            if message.chat and message.chat.id == self.rename_bot_id:
-                return message
+            if not message.chat or message.chat.id != self.rename_bot_id:
+                continue
+            if after_message_id is not None and int(getattr(message, "id", 0)) <= int(after_message_id):
+                continue
+            reply_to_id = getattr(message, "reply_to_message_id", None)
+            if reply_to_id is None:
+                reply = getattr(message, "reply_to_message", None)
+                reply_to_id = getattr(reply, "id", None) if reply else None
+            if reply_to_id is not None and reply_to_ids is not None and int(reply_to_id) not in reply_to_ids:
+                continue
+            return message
+
+    async def _advance_job_stage(self, source_id: int, message_id: int, expected: str, stage: str, **fields):
+        if not await db.advance_job_stage(source_id, message_id, expected, stage, **fields):
+            raise RuntimeError(f"Rename job state changed unexpectedly ({expected} → {stage}); stopping to avoid duplicate actions.")
+
+    @staticmethod
+    def _safe_to_retry(stage: str | None, attempts: int) -> bool:
+        """Only retry preflight failures, before a rename-bot action can occur."""
+        return stage == "preflight" and int(attempts) < MAX_RENAME_ATTEMPTS
 
     @staticmethod
     async def _bounded_flood_retry(operation, *args, **kwargs):
@@ -254,6 +285,8 @@ class RenameRuntime:
     async def _rename_conversation(self, source_message, config: dict) -> tuple[object, str]:
         if not self.user_client or not self.rename_bot_id:
             raise RuntimeError("The logged-in account or rename bot is unavailable.")
+        source_id = int(source_message.chat.id)
+        source_message_id = int(source_message.id)
         async with self._conversation_lock:
             while not self._rename_messages.empty():
                 try:
@@ -265,19 +298,59 @@ class RenameRuntime:
             thumbnail = config.get("thumbnail")
             if not thumbnail:
                 raise RuntimeError("No thumbnail is configured for this source channel.")
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "preflight",
+                "thumbnail_sending",
+                conversation_started_at=datetime.now(timezone.utc),
+            )
             photo = io.BytesIO(bytes(thumbnail))
             photo.name = "source-thumbnail.jpg"
             await self._bounded_flood_retry(self.user_client.send_photo, self.rename_bot_id, photo)
-            await self._bounded_flood_retry(source_message.copy, self.rename_bot_id)
+            await self._advance_job_stage(source_id, source_message_id, "thumbnail_sending", "thumbnail_sent")
+            await self._advance_job_stage(source_id, source_message_id, "thumbnail_sent", "media_sending")
+            sent_media = await self._bounded_flood_retry(source_message.copy, self.rename_bot_id)
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "media_sending",
+                "media_sent",
+                rename_bot_media_message_id=getattr(sent_media, "id", None),
+            )
 
             prompt = None
             while prompt is None:
-                candidate = await self._next_rename_message(deadline)
+                candidate = await self._next_rename_message(
+                    deadline,
+                    after_message_id=getattr(sent_media, "id", None),
+                    reply_to_ids={int(sent_media.id)} if getattr(sent_media, "id", None) is not None else None,
+                )
                 text = candidate.text or candidate.caption or ""
                 if re.search(r"please\s+enter\s+new\s+filename|old\s+file\s+name", text, re.IGNORECASE):
+                    prompt_filename = extract_original_filename(text)
+                    source_filename = self._source_filename(source_message)
+                    if prompt_filename and source_filename:
+                        expected_name = os.path.basename(source_filename.replace("\\", "/")).casefold()
+                        observed_name = os.path.basename(prompt_filename.replace("\\", "/")).casefold()
+                        if observed_name != expected_name:
+                            logger.warning(
+                                "Ignoring stale rename-bot prompt for %s while processing source=%s/%s.",
+                                prompt_filename,
+                                source_id,
+                                source_message_id,
+                            )
+                            continue
                     prompt = candidate
                 elif re.search(r"error|failed|invalid", text, re.IGNORECASE):
                     raise RuntimeError(f"Rename bot reported an error: {text[:500]}")
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "media_sent",
+                "filename_prompt_received",
+                filename_prompt_message_id=prompt.id,
+            )
 
             text = prompt.text or prompt.caption or ""
             original = extract_original_filename(text, self._source_filename(source_message))
@@ -285,34 +358,110 @@ class RenameRuntime:
                 raise RuntimeError("The rename bot did not provide a usable original filename.")
             username = await db.get_username()
             new_filename = append_username(original, username)
-            await self._bounded_flood_retry(
+            await self._advance_job_stage(source_id, source_message_id, "filename_prompt_received", "filename_sending")
+            filename_reply = await self._bounded_flood_retry(
                 self.user_client.send_message,
                 self.rename_bot_id,
                 new_filename,
                 reply_to_message_id=prompt.id,
             )
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "filename_sending",
+                "filename_submitted",
+                filename_message_id=getattr(filename_reply, "id", None),
+                requested_filename=new_filename,
+            )
 
             menu = None
+            second_button = None
             while menu is None:
-                candidate = await self._next_rename_message(deadline)
+                candidate = await self._next_rename_message(
+                    deadline,
+                    after_message_id=getattr(filename_reply, "id", None),
+                    reply_to_ids={
+                        int(value)
+                        for value in (getattr(filename_reply, "id", None), getattr(prompt, "id", None), getattr(sent_media, "id", None))
+                        if value is not None
+                    },
+                )
                 if candidate.reply_markup and getattr(candidate.reply_markup, "inline_keyboard", None):
+                    try:
+                        second_button = select_second_inline_button(candidate.reply_markup)
+                    except ValueError as exc:
+                        logger.warning("Ignoring an unusable rename-bot keyboard for source=%s/%s: %s", source_id, source_message_id, exc)
+                        continue
                     menu = candidate
                 else:
                     body = candidate.text or candidate.caption or ""
                     if re.search(r"error|failed|invalid", body, re.IGNORECASE):
                         raise RuntimeError(f"Rename bot reported an error: {body[:500]}")
-            second_button = select_second_inline_button(menu.reply_markup)
-            await self._bounded_flood_retry(
-                self.user_client.request_callback_answer,
-                chat_id=self.rename_bot_id,
-                message_id=menu.id,
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "filename_submitted",
+                "menu_received",
+                rename_bot_menu_message_id=menu.id,
+                callback_button_position=2,
                 callback_data=second_button.callback_data,
-                timeout=30,
             )
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "menu_received",
+                "callback_submitting",
+                callback_attempted_at=datetime.now(timezone.utc),
+                callback_attempt_count=1,
+            )
+            try:
+                await self.user_client.request_callback_answer(
+                    chat_id=self.rename_bot_id,
+                    message_id=menu.id,
+                    callback_data=second_button.callback_data,
+                    timeout=30,
+                )
+            except BotResponseTimeout:
+                # The action may have succeeded even though the callback answer timed
+                # out. Never submit that callback again; wait for the resulting media.
+                logger.warning("Rename-bot callback answer timed out for source=%s/%s; waiting without retrying the callback.", source_id, source_message_id)
+                await self._advance_job_stage(
+                    source_id,
+                    source_message_id,
+                    "callback_submitting",
+                    "callback_unknown",
+                    callback_outcome="unknown_after_timeout",
+                )
+                callback_stage = "callback_unknown"
+            else:
+                await self._advance_job_stage(
+                    source_id,
+                    source_message_id,
+                    "callback_submitting",
+                    "callback_submitted",
+                    callback_outcome="acknowledged",
+                    callback_completed_at=datetime.now(timezone.utc),
+                )
+                callback_stage = "callback_submitted"
 
             while True:
-                candidate = await self._next_rename_message(deadline)
+                candidate = await self._next_rename_message(
+                    deadline,
+                    after_message_id=int(menu.id),
+                    reply_to_ids={
+                        int(value)
+                        for value in (getattr(menu, "id", None), getattr(filename_reply, "id", None), getattr(sent_media, "id", None))
+                        if value is not None
+                    },
+                )
                 if candidate.video or candidate.document:
+                    await self._advance_job_stage(
+                        source_id,
+                        source_message_id,
+                        callback_stage,
+                        "final_received",
+                        rename_bot_message_id=candidate.id,
+                    )
                     return candidate, new_filename
                 body = candidate.text or candidate.caption or ""
                 if re.search(r"error|failed|invalid", body, re.IGNORECASE):
@@ -398,11 +547,12 @@ class RenameRuntime:
             if not source_message or not (source_message.video or source_message.document):
                 raise RuntimeError("Source message is no longer available or is not a video/document.")
             final_message, new_filename = await self._rename_conversation(source_message, config)
-            await db.update_job(
+            await self._advance_job_stage(
                 source_id,
                 message_id,
+                "final_received",
+                "publishing",
                 status="publishing",
-                stage="publishing",
                 final_filename=new_filename,
                 rename_bot_message_id=final_message.id,
             )
@@ -436,11 +586,14 @@ class RenameRuntime:
             current = await db.get_job(source_id, message_id)
             attempt_count = int(current.get("attempts", 0)) if current else MAX_RENAME_ATTEMPTS
             stage = current.get("stage") if current else "publishing"
-            can_retry = stage != "publishing" and attempt_count < MAX_RENAME_ATTEMPTS
+            # Once the rename bot has seen any side effect, restarting the full
+            # conversation can rename the same media again or repeat its callback.
+            can_retry = self._safe_to_retry(stage, attempt_count)
             await db.update_job(
                 source_id,
                 message_id,
                 status="pending" if can_retry else "failed",
+                stage="preflight" if can_retry else stage,
                 error=error,
             )
             if can_retry:
