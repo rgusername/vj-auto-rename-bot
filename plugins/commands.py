@@ -75,20 +75,27 @@ async def set_channel(client, message):
     except ValueError:
         return await message.reply_text("Both channel IDs must be valid negative Telegram chat IDs, usually beginning with <code>-100</code>.")
 
-    if not rename_runtime.user_client:
-        return await message.reply_text("Log in first with /login; the saved user account is needed to validate and access both channels.")
     try:
-        source_chat = await rename_runtime.user_client.get_chat(source_id)
-        output_chat = await rename_runtime.user_client.get_chat(output_id)
+        session_ready = await rename_runtime.ensure_user_session(message.from_user.id)
+    except Exception:
+        logger.exception("Could not restore or validate the administrator's saved Telegram session.")
+        return await message.reply_text("Could not restore your saved Telegram session right now. Please check database connectivity and try again.")
+    if not session_ready or not rename_runtime.user_client:
+        return await message.reply_text("No usable saved Telegram session was found for your account. Use /login once, then retry /set.")
+
+    user_client = rename_runtime.user_client
+    try:
+        source_chat = await user_client.get_chat(source_id)
+        output_chat = await user_client.get_chat(output_id)
         if source_chat.type != ChatType.CHANNEL:
             raise ValueError("The source chat is not a channel.")
         if output_chat.type != ChatType.CHANNEL:
             raise ValueError("The output chat is not a channel.")
-        account = await rename_runtime.user_client.get_me()
-        source_member = await rename_runtime.user_client.get_chat_member(source_id, account.id)
+        account = await user_client.get_me()
+        source_member = await user_client.get_chat_member(source_id, account.id)
         if source_member.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
-            raise ValueError("The logged-in account is not a member allowed to read the source channel.")
-        output_member = await rename_runtime.user_client.get_chat_member(output_id, account.id)
+            raise ValueError("Your logged-in account cannot access the source channel. Join it with that account and retry.")
+        output_member = await user_client.get_chat_member(output_id, account.id)
         if output_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             raise ValueError("The logged-in account must be an administrator of the output channel.")
         if output_member.status == ChatMemberStatus.ADMINISTRATOR and not (
