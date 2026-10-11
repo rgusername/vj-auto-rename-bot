@@ -107,4 +107,4 @@ async def login_user(bot: Client, message: Message):
 
     await bot.send_message(user_id, "<b>Telegram account login succeeded. Your session has been saved and will be restored after restarts.</b>")
     if user_id == rename_runtime.session_owner_id:
-        await rename_runtime.start_user_session(session_string)
+        await rename_runtime.start_user_session(session_string, owner_id=user_id)
