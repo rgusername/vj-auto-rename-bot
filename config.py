@@ -22,7 +22,7 @@ def _parse_ids(raw: str) -> tuple[int, ...]:
 API_ID = int(environ.get("API_ID", "24916173") or "0")
 API_HASH = environ.get("API_HASH", "5c82a6ae14e291efc20dee7757c9feee")
 BOT_TOKEN = environ.get("BOT_TOKEN", "8765889989:AAHy6H9mmC-9ZnAYVuKKSeiiYs4aMLhizpQ")
-DB_URI = environ.get("DB_URI", "mongodb+srv://ruhang:ruhang@cluster0.qimyv7h.mongodb.net/?appName=Cluster0")
+DB_URI = environ.get("DB_URI", "mongodb+srv://ruhang246:ruhang246@cluster0.dvrq5g2.mongodb.net/?appName=Cluster0")
 DB_NAME = environ.get("DB_NAME", "vjjoinrequetbot1")
 
 ADMINS = _parse_ids(environ.get("ADMINS", "7622078787"))
