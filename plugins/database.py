@@ -99,6 +99,7 @@ class Database:
                 "output_channel_id": int(output_id),
                 "status": "pending",
                 "stage": "queued",
+                "workflow_version": 2,
                 "attempts": 0,
                 "created_at": now,
                 "updated_at": now,
@@ -117,10 +118,37 @@ class Database:
             {"$set": fields},
         )
 
+    async def advance_job_stage(self, source_id: int, message_id: int, expected_stage: str, stage: str, **fields) -> bool:
+        """Atomically checkpoint a workflow step before or after an external side effect."""
+        fields.update({"stage": stage, "updated_at": datetime.now(timezone.utc)})
+        result = await self.jobs.update_one(
+            {
+                "source_channel_id": int(source_id),
+                "source_message_id": int(message_id),
+                "status": "processing",
+                "stage": expected_stage,
+            },
+            {"$set": fields},
+        )
+        return result.modified_count == 1
+
     async def claim_job(self, source_id: int, message_id: int) -> bool:
         result = await self.jobs.update_one(
-            {"source_channel_id": int(source_id), "source_message_id": int(message_id), "status": "pending"},
-            {"$set": {"status": "processing", "updated_at": datetime.now(timezone.utc)}, "$inc": {"attempts": 1}},
+            {
+                "source_channel_id": int(source_id),
+                "source_message_id": int(message_id),
+                "status": "pending",
+                "stage": {"$in": ["queued", "preflight"]},
+            },
+            {
+                "$set": {
+                    "status": "processing",
+                    "stage": "preflight",
+                    "workflow_version": 2,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$inc": {"attempts": 1},
+            },
         )
         return result.modified_count == 1
 
@@ -134,17 +162,33 @@ class Database:
         return counts
 
     async def recover_interrupted_jobs(self, max_attempts: int = 3):
-        """Make pre-publish interrupted jobs retryable; keep uncertain publishes fenced."""
+        """Retry only jobs known not to have started an external rename conversation."""
         await self.jobs.update_many(
-            {"status": "processing"},
-            {"$set": {"status": "pending", "error": "Recovered after interrupted processing; safe to retry.", "updated_at": datetime.now(timezone.utc)}},
+            {"status": "processing", "workflow_version": 2, "stage": "preflight"},
+            {"$set": {"status": "pending", "error": "Recovered before rename-bot interaction; safe to retry.", "updated_at": datetime.now(timezone.utc)}},
+        )
+        await self.jobs.update_many(
+            {"status": "processing", "workflow_version": 2, "stage": {"$ne": "preflight"}},
+            {"$set": {"status": "failed", "error": "Interrupted after rename-bot interaction began; not restarted to prevent duplicate rename/callback actions.", "updated_at": datetime.now(timezone.utc)}},
         )
         await self.jobs.update_many(
             {"status": "publishing"},
             {"$set": {"status": "failed", "stage": "publishing", "error": "Interrupted during output publish; inspect output channel before manual retry.", "updated_at": datetime.now(timezone.utc)}},
         )
+        # Old job records do not have stage checkpoints. An attempt already made by
+        # an older runtime may have reached the rename bot, so fence it rather than
+        # restarting that non-idempotent conversation after an upgrade/restart.
         await self.jobs.update_many(
-            {"status": "failed", "stage": {"$nin": ["publishing", "cancelled"]}, "attempts": {"$lt": int(max_attempts)}},
+            {
+                "workflow_version": {"$ne": 2},
+                "status": {"$in": ["pending", "processing", "failed"]},
+                "attempts": {"$gt": 0},
+                "stage": {"$nin": ["publishing", "cancelled"]},
+            },
+            {"$set": {"status": "failed", "stage": "legacy_ambiguous", "error": "Legacy job state is ambiguous; not retried to avoid repeating a rename-bot workflow.", "updated_at": datetime.now(timezone.utc)}},
+        )
+        await self.jobs.update_many(
+            {"status": "failed", "workflow_version": 2, "stage": "preflight", "attempts": {"$lt": int(max_attempts)}},
             {"$set": {"status": "pending", "error": "Scheduled for bounded retry after restart.", "updated_at": datetime.now(timezone.utc)}},
         )
 
