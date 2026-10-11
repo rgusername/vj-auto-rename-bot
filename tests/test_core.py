@@ -101,14 +101,109 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
 
         runtime = RenameRuntime()
         runtime.user_client = object()
-        cursor = AsyncCursor([{"source_channel_id": -100101, "source_message_id": 42}])
+        cursor = AsyncCursor([
+            {"source_channel_id": -100101, "source_message_id": 42},
+            {"source_channel_id": -100101, "source_message_id": 43},
+        ])
         with patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=cursor)) as get_pending, patch(
             "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
         ), patch.object(runtime, "_launch_job") as launch_job:
             await runtime.resume_pending_jobs()
 
         get_pending.assert_awaited_once_with()
-        launch_job.assert_called_once_with((-100101, 42), -100101, 42)
+        self.assertEqual(launch_job.call_count, 2)
+        launch_job.assert_any_call((-100101, 42), -100101, 42)
+        launch_job.assert_any_call((-100101, 43), -100101, 43)
+
+
+class VideoPublicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_is_uploaded_once_with_original_metadata_and_no_forward(self):
+        runtime = RenameRuntime()
+        payload = b"video bytes including audio and quality data"
+        captured = {}
+
+        async def download(file_name):
+            with open(file_name, "wb") as handle:
+                handle.write(payload)
+            return file_name
+
+        async def send_video(chat_id, video_path, **kwargs):
+            with open(video_path, "rb") as handle:
+                captured["bytes"] = handle.read()
+            captured["chat_id"] = chat_id
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(id=987)
+
+        caption_entities = [SimpleNamespace(type="bold", offset=0, length=7)]
+        final_message = SimpleNamespace(
+            video=SimpleNamespace(
+                file_name="original.mp4",
+                duration=125,
+                width=1920,
+                height=1080,
+                supports_streaming=True,
+            ),
+            document=None,
+            caption="S01E02 | 1080p | AAC",
+            caption_entities=caption_entities,
+            has_media_spoiler=False,
+            download=AsyncMock(side_effect=download),
+            copy=AsyncMock(),
+        )
+        runtime.user_client = SimpleNamespace(
+            send_video=AsyncMock(side_effect=send_video),
+            send_document=AsyncMock(),
+        )
+
+        result = await runtime._publish_result(
+            final_message,
+            -100202,
+            b"normalized-thumbnail",
+            "renamed @tag.mp4",
+        )
+
+        self.assertEqual(result.id, 987)
+        self.assertEqual(captured["bytes"], payload)
+        self.assertEqual(captured["chat_id"], -100202)
+        self.assertEqual(runtime.user_client.send_video.await_count, 1)
+        runtime.user_client.send_document.assert_not_awaited()
+        final_message.copy.assert_not_awaited()
+        options = captured["kwargs"]
+        self.assertEqual(options["file_name"], "renamed @tag.mp4")
+        self.assertEqual(options["caption"], "S01E02 | 1080p | AAC")
+        self.assertIs(options["caption_entities"], caption_entities)
+        self.assertEqual((options["duration"], options["width"], options["height"]), (125, 1920, 1080))
+        self.assertTrue(options["supports_streaming"])
+        self.assertEqual(options["thumb"].getvalue(), b"normalized-thumbnail")
+
+    async def test_video_upload_failure_does_not_forward_or_retry_as_copy(self):
+        runtime = RenameRuntime()
+
+        async def download(file_name):
+            with open(file_name, "wb") as handle:
+                handle.write(b"video bytes")
+            return file_name
+
+        final_message = SimpleNamespace(
+            video=SimpleNamespace(file_name="original.mp4", duration=1, width=1, height=1),
+            document=None,
+            caption="",
+            caption_entities=None,
+            has_media_spoiler=False,
+            download=AsyncMock(side_effect=download),
+            copy=AsyncMock(),
+        )
+        runtime.user_client = SimpleNamespace(
+            send_video=AsyncMock(side_effect=RuntimeError("upload failed")),
+            send_document=AsyncMock(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "upload failed"):
+            await runtime._publish_result(final_message, -100202, b"thumbnail", "renamed.mp4")
+
+        runtime.user_client.send_video.assert_awaited_once()
+        runtime.user_client.send_document.assert_not_awaited()
+        final_message.copy.assert_not_awaited()
 
 
 class SessionPreservationTests(unittest.IsolatedAsyncioTestCase):
