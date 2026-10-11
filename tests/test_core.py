@@ -1,3 +1,4 @@
+import asyncio
 import io
 import unittest
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from pymongo.errors import DuplicateKeyError
 from PIL import Image
+from pyrogram.errors import BotResponseTimeout
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.commands import _normalize_thumbnail
@@ -76,6 +78,130 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await runtime.ensure_user_session(123))
         get_session.assert_not_awaited()
         self.assertEqual(runtime.active_session_owner_id, 123)
+
+    async def test_callback_timeout_waits_for_result_without_repeating_callback(self):
+        runtime = RenameRuntime()
+        runtime.rename_bot_id = 999
+        stale_prompt = SimpleNamespace(
+            id=12,
+            chat=SimpleNamespace(id=999),
+            text="Please enter new filename\nOld File Name :- another_episode.mp4",
+            caption=None,
+            reply_to_message_id=11,
+            reply_markup=None,
+            video=None,
+            document=None,
+        )
+        prompt = SimpleNamespace(
+            id=13,
+            chat=SimpleNamespace(id=999),
+            text="Please enter new filename\nOld File Name :- episode.mp4",
+            caption=None,
+            reply_to_message_id=11,
+            reply_markup=None,
+            video=None,
+            document=None,
+        )
+        menu = SimpleNamespace(
+            id=15,
+            chat=SimpleNamespace(id=999),
+            text="Select output type",
+            caption=None,
+            reply_to_message_id=14,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("document", callback_data="doc")],
+                [InlineKeyboardButton("video", callback_data="video")],
+            ]),
+            video=None,
+            document=None,
+        )
+        final = SimpleNamespace(
+            id=16,
+            chat=SimpleNamespace(id=999),
+            text=None,
+            caption="S01E01",
+            reply_to_message_id=15,
+            reply_markup=None,
+            video=SimpleNamespace(file_name="episode.mp4"),
+            document=None,
+        )
+        sent_media = SimpleNamespace(id=11)
+
+        async def copy_to_rename_bot(_chat_id):
+            await runtime._rename_messages.put(stale_prompt)
+            await runtime._rename_messages.put(prompt)
+            return sent_media
+
+        async def reply_filename(_chat_id, _filename, **_kwargs):
+            await runtime._rename_messages.put(menu)
+            return SimpleNamespace(id=14)
+
+        async def callback_once(**_kwargs):
+            await runtime._rename_messages.put(final)
+            raise BotResponseTimeout("BOT_RESPONSE_TIMEOUT")
+
+        source_message = SimpleNamespace(
+            id=7,
+            chat=SimpleNamespace(id=-100100),
+            video=SimpleNamespace(file_name="episode.mp4"),
+            document=None,
+            copy=AsyncMock(side_effect=copy_to_rename_bot),
+        )
+        runtime.user_client = SimpleNamespace(
+            send_photo=AsyncMock(return_value=SimpleNamespace(id=10)),
+            send_message=AsyncMock(side_effect=reply_filename),
+            request_callback_answer=AsyncMock(side_effect=callback_once),
+        )
+        current = {"stage": "preflight", "transitions": []}
+
+        async def advance(_source, _message, expected, new_stage, **_fields):
+            if current["stage"] != expected:
+                return False
+            current["transitions"].append((expected, new_stage))
+            current["stage"] = new_stage
+            return True
+
+        with patch("plugins.rename_runtime.db.advance_job_stage", new=AsyncMock(side_effect=advance)), patch(
+            "plugins.rename_runtime.db.get_username", new=AsyncMock(return_value="")
+        ):
+            returned, filename = await runtime._rename_conversation(source_message, {"thumbnail": b"thumb"})
+
+        self.assertIs(returned, final)
+        self.assertEqual(filename, "episode.mp4")
+        runtime.user_client.request_callback_answer.assert_awaited_once()
+        runtime.user_client.send_photo.assert_awaited_once()
+        source_message.copy.assert_awaited_once()
+        self.assertEqual(current["stage"], "final_received")
+        self.assertIn(("callback_submitting", "callback_unknown"), current["transitions"])
+        self.assertIn(("callback_unknown", "final_received"), current["transitions"])
+
+    def test_only_preflight_failures_are_safe_to_retry(self):
+        self.assertTrue(RenameRuntime._safe_to_retry("preflight", 1))
+        for stage in ("thumbnail_sending", "media_sent", "filename_submitted", "callback_submitted", "publishing"):
+            self.assertFalse(RenameRuntime._safe_to_retry(stage, 1), stage)
+
+    async def test_timeout_after_callback_does_not_requeue_same_rename_workflow(self):
+        runtime = RenameRuntime()
+        source_message = SimpleNamespace(
+            video=SimpleNamespace(file_name="episode.mp4"),
+            document=None,
+        )
+        runtime.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=source_message))
+        runtime._rename_conversation = AsyncMock(side_effect=asyncio.TimeoutError("final media timed out"))
+        job = {"attempts": 1, "output_channel_id": -100202}
+        current = {"attempts": 1, "stage": "callback_unknown"}
+
+        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, current])), patch(
+            "plugins.rename_runtime.db.claim_job", new=AsyncMock(return_value=True)
+        ), patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
+        ), patch("plugins.rename_runtime.db.update_job", new=AsyncMock()) as update_job:
+            await runtime._process_job(-100101, 42)
+
+        update_job.assert_awaited_once()
+        fields = update_job.await_args.kwargs
+        self.assertEqual(fields["status"], "failed")
+        self.assertEqual(fields["stage"], "callback_unknown")
 
     async def test_requesters_saved_session_is_restored_without_relogin(self):
         runtime = RenameRuntime()
@@ -235,25 +361,56 @@ class DatabaseMappingTests(unittest.IsolatedAsyncioTestCase):
 class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_claim_is_atomic_against_pending_status(self):
         database = Database.__new__(Database)
-        database.jobs = SimpleNamespace(update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)))
+        database.jobs = SimpleNamespace(update_one=AsyncMock(side_effect=[
+            SimpleNamespace(modified_count=1),
+            SimpleNamespace(modified_count=0),
+        ]))
         self.assertTrue(await database.claim_job(-100111, 42))
+        self.assertFalse(await database.claim_job(-100111, 42))
         query = database.jobs.update_one.await_args.args[0]
         update = database.jobs.update_one.await_args.args[1]
         self.assertEqual(query["status"], "pending")
+        self.assertEqual(query["stage"], {"$in": ["queued", "preflight"]})
         self.assertEqual(update["$inc"]["attempts"], 1)
 
-    async def test_restart_recovery_retries_only_nonpublishing_failed_work(self):
+    async def test_startup_installs_compound_unique_source_message_index(self):
+        database = Database.__new__(Database)
+        database._client = SimpleNamespace(admin=SimpleNamespace(command=AsyncMock()))
+        database.configs = SimpleNamespace(create_index=AsyncMock())
+        database.jobs = SimpleNamespace(create_index=AsyncMock())
+
+        await database.init()
+
+        database.jobs.create_index.assert_any_await(
+            [("source_channel_id", 1), ("source_message_id", 1)],
+            unique=True,
+        )
+
+    async def test_restart_recovery_retries_only_safe_preflight_work(self):
         database = Database.__new__(Database)
         database.jobs = SimpleNamespace(update_many=AsyncMock())
         await database.recover_interrupted_jobs(max_attempts=3)
-        self.assertEqual(database.jobs.update_many.await_count, 3)
+        self.assertEqual(database.jobs.update_many.await_count, 5)
         calls = database.jobs.update_many.await_args_list
-        self.assertEqual(calls[0].args[0], {"status": "processing"})
+        self.assertEqual(calls[0].args[0], {"status": "processing", "workflow_version": 2, "stage": "preflight"})
         self.assertEqual(calls[0].args[1]["$set"]["status"], "pending")
-        self.assertEqual(calls[1].args[0], {"status": "publishing"})
+        self.assertEqual(calls[1].args[0]["stage"], {"$ne": "preflight"})
         self.assertEqual(calls[1].args[1]["$set"]["status"], "failed")
-        self.assertEqual(calls[2].args[0]["stage"]["$nin"], ["publishing", "cancelled"])
-        self.assertEqual(calls[2].args[0]["attempts"]["$lt"], 3)
+        self.assertEqual(calls[2].args[0], {"status": "publishing"})
+        self.assertEqual(calls[2].args[1]["$set"]["status"], "failed")
+        self.assertEqual(calls[3].args[0]["workflow_version"], {"$ne": 2})
+        self.assertEqual(calls[3].args[0]["attempts"]["$gt"], 0)
+        self.assertEqual(calls[4].args[0]["stage"], "preflight")
+        self.assertEqual(calls[4].args[0]["attempts"]["$lt"], 3)
+
+    async def test_job_stage_transition_is_atomic_and_requires_expected_state(self):
+        database = Database.__new__(Database)
+        database.jobs = SimpleNamespace(update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)))
+        self.assertTrue(await database.advance_job_stage(-100111, 42, "preflight", "thumbnail_sending"))
+        call = database.jobs.update_one.await_args
+        self.assertEqual(call.args[0]["status"], "processing")
+        self.assertEqual(call.args[0]["stage"], "preflight")
+        self.assertEqual(call.args[1]["$set"]["stage"], "thumbnail_sending")
 
 
 class DatabaseDuplicateTests(unittest.IsolatedAsyncioTestCase):
@@ -272,6 +429,7 @@ class DatabaseDuplicateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["source_message_id"], 42)
         self.assertEqual(payload["output_channel_id"], -100222)
         self.assertEqual(payload["status"], "pending")
+        self.assertEqual(payload["workflow_version"], 2)
 
 
 if __name__ == "__main__":
