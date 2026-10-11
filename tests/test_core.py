@@ -115,12 +115,22 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             video=None,
             document=None,
         )
-        final = SimpleNamespace(
+        auto_delete_notice = SimpleNamespace(
             id=16,
+            chat=SimpleNamespace(id=999),
+            text="⏳ Auto-Delete Notice: this file will be deleted soon.",
+            caption=None,
+            reply_to_message_id=15,
+            reply_markup=None,
+            video=None,
+            document=None,
+        )
+        final = SimpleNamespace(
+            id=17,
             chat=SimpleNamespace(id=999),
             text=None,
             caption="S01E01",
-            reply_to_message_id=15,
+            reply_to_message_id=16,
             reply_markup=None,
             video=SimpleNamespace(file_name="episode.mp4"),
             document=None,
@@ -137,6 +147,7 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(id=14)
 
         async def callback_once(**_kwargs):
+            await runtime._rename_messages.put(auto_delete_notice)
             await runtime._rename_messages.put(final)
             raise BotResponseTimeout("BOT_RESPONSE_TIMEOUT")
 
