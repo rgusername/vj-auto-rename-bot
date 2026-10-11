@@ -46,6 +46,7 @@ class RenameRuntime:
         self.bot_client = None
         self.user_client = None
         self.rename_bot_id = None
+        self.active_session_owner_id = 0
         self._rename_messages = asyncio.Queue()
         self._conversation_lock = asyncio.Lock()
         self._jobs: dict[tuple[int, int], asyncio.Task] = {}
@@ -72,14 +73,38 @@ class RenameRuntime:
             return False
         return await self.start_user_session(session)
 
-    async def start_user_session(self, session: str | None = None):
+    async def ensure_user_session(self, user_id: int) -> bool:
+        """Reuse a live account or restore this administrator's saved session on demand."""
+        user_id = int(user_id)
         if self.user_client and getattr(self.user_client, "is_connected", False):
-            return True
-        session = session or await db.get_session(self.session_owner_id)
+            try:
+                account = await self.user_client.get_me()
+                if account and int(account.id) == user_id:
+                    self.active_session_owner_id = user_id
+                    return True
+            except Exception:
+                logger.warning("The current Telegram user session is no longer valid; attempting saved-session restore.", exc_info=True)
+
+        session = await db.get_session(user_id)
         if not session:
             return False
-        if not RENAME_BOT_USERNAME:
-            logger.warning("Cannot start user monitor: RENAME_BOT_USERNAME is not configured.")
+        if self.user_client:
+            await self.stop_user_session()
+        return await self.start_user_session(session, owner_id=user_id)
+
+    async def start_user_session(self, session: str | None = None, owner_id: int | None = None):
+        owner_id = int(owner_id or self.session_owner_id)
+        if self.user_client and getattr(self.user_client, "is_connected", False):
+            try:
+                account = await self.user_client.get_me()
+                if account and int(account.id) == owner_id:
+                    self.active_session_owner_id = owner_id
+                    return True
+            except Exception:
+                logger.warning("Existing Telegram user session is not healthy; replacing it.", exc_info=True)
+            await self.stop_user_session()
+        session = session or await db.get_session(owner_id)
+        if not session:
             return False
         client = Client(
             ":memory:",
@@ -91,16 +116,25 @@ class RenameRuntime:
         )
         try:
             await client.start()
-            rename_peer = await client.get_users(RENAME_BOT_USERNAME)
-            self.rename_bot_id = rename_peer.id
-            bot_filter = filters.private & filters.incoming & filters.user(self.rename_bot_id)
-            client.add_handler(MessageHandler(self._on_rename_bot_message, bot_filter), group=self._handler_group)
-            client.add_handler(EditedMessageHandler(self._on_rename_bot_message, bot_filter), group=self._handler_group)
-            client.add_handler(
-                MessageHandler(self._on_source_message, filters.channel & (filters.video | filters.document)),
-                group=self._handler_group + 1,
-            )
+            self.rename_bot_id = None
+            if RENAME_BOT_USERNAME:
+                try:
+                    rename_peer = await client.get_users(RENAME_BOT_USERNAME)
+                    self.rename_bot_id = rename_peer.id
+                    bot_filter = filters.private & filters.incoming & filters.user(self.rename_bot_id)
+                    client.add_handler(MessageHandler(self._on_rename_bot_message, bot_filter), group=self._handler_group)
+                    client.add_handler(EditedMessageHandler(self._on_rename_bot_message, bot_filter), group=self._handler_group)
+                    client.add_handler(
+                        MessageHandler(self._on_source_message, filters.channel & (filters.video | filters.document)),
+                        group=self._handler_group + 1,
+                    )
+                except Exception:
+                    self.rename_bot_id = None
+                    logger.warning("Could not resolve RENAME_BOT_USERNAME; saved session remains available for /set channel validation.", exc_info=True)
+            else:
+                logger.info("RENAME_BOT_USERNAME is unset; saved session will be available for /set, but media monitoring is disabled.")
             self.user_client = client
+            self.active_session_owner_id = owner_id
             await db.recover_interrupted_jobs(MAX_RENAME_ATTEMPTS)
             logger.info("Logged-in user session started; monitoring configured source channels.")
             await self.resume_pending_jobs()
@@ -112,11 +146,13 @@ class RenameRuntime:
             except Exception:
                 pass
             self.user_client = None
+            self.active_session_owner_id = 0
             return False
 
     async def stop_user_session(self):
         client, self.user_client = self.user_client, None
         self.rename_bot_id = None
+        self.active_session_owner_id = 0
         if client and getattr(client, "is_connected", False):
             try:
                 await client.stop()
