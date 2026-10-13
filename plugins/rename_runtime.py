@@ -17,12 +17,19 @@ from config import (
     API_ID,
     ADMINS,
     MAX_RENAME_ATTEMPTS,
+    QUALITY_PRIORITY_ENABLED,
     RENAME_BOT_USERNAME,
     RENAME_RESPONSE_TIMEOUT,
     SESSION_OWNER_ID,
 )
 from plugins.database import db
-from plugins.filename_utils import append_username, extract_original_filename, sanitize_filename
+from plugins.filename_utils import (
+    append_username,
+    extract_original_filename,
+    extract_video_metadata,
+    quality_priority,
+    sanitize_filename,
+)
 
 logger = logging.getLogger(__name__)
 _VIDEO_EXTENSIONS = frozenset({
@@ -60,7 +67,19 @@ class RenameRuntime:
         self.active_session_owner_id = 0
         self._rename_messages = asyncio.Queue()
         self._conversation_lock = asyncio.Lock()
+        self._accept_lock = asyncio.Lock()
+        self._submission_items: list[dict] = []
+        self._submission_sequence = 0
+        self._submission_event = asyncio.Event()
+        self._submission_worker_task: asyncio.Task | None = None
+        self._queued_keys: set[tuple[int, int]] = set()
         self._jobs: dict[tuple[int, int], asyncio.Task] = {}
+        self._retry_tasks: set[asyncio.Task] = set()
+        self._retry_job_keys: dict[asyncio.Task, tuple[int, int]] = {}
+        self._background_db_tasks: set[asyncio.Task] = set()
+        self._output_waiters: dict[tuple[int, int], dict] = {}
+        self._output_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._stopping_session = False
         self._handler_group = 70
 
     @property
@@ -161,53 +180,398 @@ class RenameRuntime:
             return False
 
     async def stop_user_session(self):
+        self._stopping_session = True
         client, self.user_client = self.user_client, None
         self.rename_bot_id = None
         self.active_session_owner_id = 0
+        tasks = list(self._jobs.values()) + list(self._output_tasks.values()) + list(self._retry_tasks) + list(self._background_db_tasks)
+        worker, self._submission_worker_task = self._submission_worker_task, None
+        if worker:
+            tasks.append(worker)
+        tasks = list({task for task in tasks if task and not task.done()})
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if client and getattr(client, "is_connected", False):
             try:
                 await client.stop()
             except Exception:
                 logger.exception("Error while stopping the logged-in user session.")
-        tasks = list(self._jobs.values())
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         self._jobs.clear()
+        self._output_tasks.clear()
+        self._retry_tasks.clear()
+        self._retry_job_keys.clear()
+        self._background_db_tasks.clear()
+        self._queued_keys.clear()
+        self._submission_items.clear()
+        self._submission_event.clear()
+        for context in self._output_waiters.values():
+            future = context.get("future")
+            if future and not future.done():
+                future.cancel()
+        self._output_waiters.clear()
+        self._stopping_session = False
 
     async def _on_rename_bot_message(self, _client, message):
-        await self._rename_messages.put(message)
+        body = message.text or message.caption or ""
+        if not (message.video or message.document) and self._is_auto_delete_notice(message):
+            reply_to = self._reply_to_message_id(message)
+            candidates = [
+                context for context in self._output_waiters.values()
+                if reply_to is not None and reply_to in context["reply_ids"]
+            ]
+            if not candidates:
+                text_matches = [
+                    context for context in self._output_waiters.values()
+                    if context.get("expected_filename") and context["expected_filename"].casefold() in body.casefold()
+                ]
+                if len(text_matches) == 1:
+                    candidates = text_matches
+                elif not text_matches and len(self._output_waiters) == 1:
+                    candidates = list(self._output_waiters.values())
+            for context in candidates:
+                context["reply_ids"].add(int(message.id))
+                task = asyncio.create_task(
+                    self._persist_output_reply_id(context["source_id"], context["message_id"], int(message.id))
+                )
+                self._background_db_tasks.add(task)
+                task.add_done_callback(self._background_db_tasks.discard)
+            logger.debug("Ignoring rename-bot auto-delete notice message_id=%s", getattr(message, "id", None))
+            return
+        if message.video or message.document:
+            if not self._route_output_message(message):
+                logger.warning("Ignoring unmatched rename-bot media message_id=%s filename=%s", getattr(message, "id", None), self._media_filename(message))
+            return
+        reply_to = self._reply_to_message_id(message)
+        if body and re.search(r"error|failed|invalid", body, re.IGNORECASE) and reply_to is not None:
+            matches = [
+                context for context in self._output_waiters.values()
+                if reply_to in context["reply_ids"] and not context["future"].done()
+            ]
+            if matches:
+                for context in matches:
+                    context["bot_error"] = body[:500]
+                    context["error_event"].set()
+                    logger.error(
+                        "Rename bot reported an error for source=%s message=%s: %s",
+                        context["source_id"],
+                        context["message_id"],
+                        body[:500],
+                    )
+                return
+        if body or message.reply_markup:
+            self._rename_messages.put_nowait(message)
+
+    @staticmethod
+    def _is_auto_delete_notice(message) -> bool:
+        body = message.text or message.caption or ""
+        return bool(re.search(r"auto[\s-]*delete\s+notice", body, re.IGNORECASE))
+
+    @staticmethod
+    def _media_filename(message) -> str | None:
+        media = message.video or message.document
+        name = getattr(media, "file_name", None) if media else None
+        return os.path.basename(name.replace("\\", "/")) if isinstance(name, str) and name else None
+
+    def _register_output_waiter(self, job: dict, expected_filename: str | None = None, reply_ids=None) -> dict:
+        source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
+        key = (source_id, message_id)
+        context = self._output_waiters.get(key)
+        if context:
+            if expected_filename:
+                context["expected_filename"] = expected_filename
+            context["reply_ids"].update(int(value) for value in (reply_ids or []) if value is not None)
+            return context
+        anchors = list(job.get("output_reply_ids", []))
+        anchors.extend([
+            job.get("rename_bot_media_message_id"),
+            job.get("filename_message_id"),
+            job.get("rename_bot_menu_message_id"),
+        ])
+        anchors.extend(reply_ids or [])
+        context = {
+            "source_id": source_id,
+            "message_id": message_id,
+            "expected_filename": expected_filename or job.get("expected_filename") or job.get("final_filename"),
+            "reply_ids": {int(value) for value in anchors if value is not None},
+            "future": asyncio.get_running_loop().create_future(),
+            "error_event": asyncio.Event(),
+            "submitted_order": job.get("submitted_at") or job.get("created_at") or datetime.now(timezone.utc),
+        }
+        self._output_waiters[key] = context
+        return context
+
+    def _route_output_message(self, message) -> bool:
+        if not (message.video or message.document):
+            return False
+        reply_to = self._reply_to_message_id(message)
+        filename = self._media_filename(message)
+        candidates = []
+        for key, context in self._output_waiters.items():
+            future = context["future"]
+            if future.done():
+                continue
+            anchor_floor = max(context["reply_ids"], default=0)
+            if int(getattr(message, "id", 0)) <= anchor_floor:
+                continue
+            reply_match = reply_to is not None and reply_to in context["reply_ids"]
+            expected = context.get("expected_filename")
+            filename_match = bool(
+                filename and expected
+                and filename.casefold() == os.path.basename(expected.replace("\\", "/")).casefold()
+            )
+            if reply_match or filename_match or (not filename and reply_to is None and len(self._output_waiters) == 1):
+                score = (3 if filename_match else 0) + (2 if reply_match else 0)
+                candidates.append((score, context["submitted_order"], key, context))
+        if not candidates:
+            return False
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            logger.error(
+                "Rename-bot output cannot be safely associated for filename=%s (ambiguous source jobs=%s); leaving it unassigned rather than publishing to the wrong job.",
+                filename or "<no filename>",
+                [(item[2][0], item[2][1]) for item in candidates if item[0] == candidates[0][0]],
+            )
+            return False
+        context = candidates[0][3]
+        context["future"].set_result(message)
+        context["output_message_id"] = int(message.id)
+        logger.info(
+            "Matched rename-bot output message=%s to source=%s message=%s filename=%s.",
+            message.id,
+            context["source_id"],
+            context["message_id"],
+            filename or context.get("expected_filename"),
+        )
+        return True
+
+    def _ensure_output_task(self, job: dict, config: dict, context: dict):
+        key = (int(job["source_channel_id"]), int(job["source_message_id"]))
+        current = self._output_tasks.get(key)
+        if current and not current.done():
+            return current
+        task = asyncio.create_task(self._track_submitted_output(job, config, context), name=f"rename-output:{key[0]}:{key[1]}")
+        self._output_tasks[key] = task
+        task.add_done_callback(lambda completed, job_key=key: self._output_tasks.pop(job_key, None) if self._output_tasks.get(job_key) is completed else None)
+        return task
+
+    async def _wait_for_output_message(self, context: dict, source_id: int, message_id: int):
+        output_future = context["future"]
+        if output_future.done():
+            return output_future.result()
+        error_task = asyncio.create_task(context["error_event"].wait())
+        try:
+            done, _ = await asyncio.wait(
+                {output_future, error_task},
+                timeout=RENAME_RESPONSE_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if output_future in done:
+                return output_future.result()
+            if error_task in done:
+                raise RuntimeError(f"Rename bot reported an error for source={source_id} message={message_id}: {context.get('bot_error', 'unknown rename-bot failure')}")
+            logger.error(
+                "No renamed media found from the rename bot after %s seconds for source=%s message=%s (expected=%s); continuing to listen without resubmitting.",
+                RENAME_RESPONSE_TIMEOUT,
+                source_id,
+                message_id,
+                context.get("expected_filename") or "unknown filename",
+            )
+            done, _ = await asyncio.wait({output_future, error_task}, return_when=asyncio.FIRST_COMPLETED)
+            if output_future in done:
+                return output_future.result()
+            raise RuntimeError(f"Rename bot reported an error for source={source_id} message={message_id}: {context.get('bot_error', 'unknown rename-bot failure')}")
+        finally:
+            if not error_task.done():
+                error_task.cancel()
+            await asyncio.gather(error_task, return_exceptions=True)
+
+    async def _track_submitted_output(self, job: dict, config: dict, context: dict):
+        source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
+        key = (source_id, message_id)
+        try:
+            final_message = await self._wait_for_output_message(context, source_id, message_id)
+            if not await db.begin_output_publish(source_id, message_id, int(final_message.id)):
+                logger.info("Output publication already claimed or job no longer eligible source=%s message=%s", source_id, message_id)
+                return
+            output_id = int(job["output_channel_id"])
+            expected_filename = context.get("expected_filename") or job.get("expected_filename") or job.get("final_filename") or self._media_filename(final_message)
+            try:
+                uploaded = await self._publish_result(final_message, output_id, config.get("thumbnail"), expected_filename)
+            except Exception as exc:
+                logger.exception("Output upload failed channel=%s source=%s message=%s", output_id, source_id, message_id)
+                await db.update_job(source_id, message_id, status="failed", stage="publishing", error=str(exc)[:1000])
+                return
+            await db.update_job(
+                source_id,
+                message_id,
+                status="completed",
+                stage="completed",
+                output_message_id=uploaded.id,
+                error=None,
+                completed_at=datetime.now(timezone.utc),
+            )
+            logger.info("Completed rename job source=%s message=%s output_channel=%s output_message=%s filename=%s", source_id, message_id, output_id, uploaded.id, expected_filename)
+            if self.bot_client and ADMINS:
+                try:
+                    await self.bot_client.send_message(ADMINS[0], f"Rename complete: <code>{expected_filename}</code>\nSource: <code>{source_id}/{message_id}</code>")
+                except Exception:
+                    logger.debug("Could not send job-completion notification to the primary administrator.", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Output tracking failed source=%s message=%s", source_id, message_id)
+            current = await db.get_job(source_id, message_id)
+            if current and current.get("status") in {"submitted", "submission_unknown"}:
+                await db.update_job(source_id, message_id, status="failed", stage="rename_bot_error", error=str(exc)[:1000])
+        finally:
+            if self._output_waiters.get(key) is context:
+                self._output_waiters.pop(key, None)
+
+    async def _recover_recent_outputs(self):
+        if not self._output_waiters or not self.user_client or not self.rename_bot_id:
+            return
+        history = getattr(self.user_client, "get_chat_history", None)
+        if not history:
+            return
+        try:
+            async for message in history(self.rename_bot_id, limit=1000):
+                if message.video or message.document:
+                    self._route_output_message(message)
+                elif self._is_auto_delete_notice(message):
+                    await self._on_rename_bot_message(self.user_client, message)
+                if not self._output_waiters:
+                    break
+        except Exception:
+            logger.exception("Could not scan recent rename-bot history to recover submitted outputs.")
 
     async def _on_source_message(self, _client, message):
         if not message.chat or message.chat.type != enums.ChatType.CHANNEL:
             return
         try:
-            config = await db.get_channel_config(message.chat.id)
-            if not config:
-                return
-            created = await db.create_job(message.chat.id, message.id, config["output_channel_id"])
+            source_id, message_id = int(message.chat.id), int(message.id)
+            media = message.video or message.document
+            media_metadata = extract_video_metadata(getattr(media, "file_name", None))
+            async with self._accept_lock:
+                config = await db.get_channel_config(source_id)
+                if not config:
+                    return
+                created = await db.create_job(
+                    source_id,
+                    message_id,
+                    config["output_channel_id"],
+                    media_metadata=media_metadata,
+                )
         except Exception:
             logger.exception("Could not load source configuration or record source=%s message=%s", message.chat.id, message.id)
             return
-        if not created or not config.get("thumbnail"):
-            # /set persists the mapping before the admin sends the image; retain any
-            # source messages as pending until the per-channel thumbnail is available.
+        if not created:
+            logger.info("Ignoring duplicate source job source=%s message=%s", source_id, message_id)
             return
-        key = (message.chat.id, message.id)
-        self._launch_job(key, message.chat.id, message.id)
+        logger.info("Accepted rename job source=%s message=%s status=queued metadata=%s", source_id, message_id, media_metadata)
+        if config.get("thumbnail"):
+            self._enqueue_job(source_id, message_id, media_metadata)
+
+    def _ensure_submission_worker(self):
+        if not self.user_client or not self.rename_bot_id:
+            return
+        if self._submission_worker_task and not self._submission_worker_task.done():
+            return
+        self._submission_worker_task = asyncio.create_task(self._submission_worker(), name="rename-submission-queue")
+
+    def _enqueue_job(self, source_id: int, message_id: int, metadata: dict | None = None) -> bool:
+        key = (int(source_id), int(message_id))
+        current = self._jobs.get(key)
+        if key in self._queued_keys or (current and not current.done()):
+            return False
+        self._submission_sequence += 1
+        self._submission_items.append({
+            "key": key,
+            "source_id": key[0],
+            "message_id": key[1],
+            "metadata": dict(metadata or {}),
+            "sequence": self._submission_sequence,
+        })
+        self._queued_keys.add(key)
+        self._submission_event.set()
+        self._ensure_submission_worker()
+        return True
+
+    def _pop_next_submission(self) -> dict:
+        if not self._submission_items:
+            raise IndexError("The shared submission queue is empty.")
+        index = 0
+        if QUALITY_PRIORITY_ENABLED:
+            first_group = self._submission_items[0]["metadata"].get("group_key")
+            if first_group:
+                end = 1
+                while end < len(self._submission_items) and self._submission_items[end]["metadata"].get("group_key") == first_group:
+                    end += 1
+                index = min(
+                    range(end),
+                    key=lambda item_index: (
+                        quality_priority(self._submission_items[item_index]["metadata"]),
+                        self._submission_items[item_index]["sequence"],
+                    ),
+                )
+        return self._submission_items.pop(index)
+
+    async def _submission_worker(self):
+        try:
+            while self.user_client and self.rename_bot_id:
+                if not self._submission_items:
+                    self._submission_event.clear()
+                    await self._submission_event.wait()
+                    continue
+                item = self._pop_next_submission()
+                key = item["key"]
+                self._queued_keys.discard(key)
+                task = asyncio.create_task(
+                    self._process_job(item["source_id"], item["message_id"]),
+                    name=f"rename-submit:{key[0]}:{key[1]}",
+                )
+                self._jobs[key] = task
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    if asyncio.current_task() and asyncio.current_task().cancelling():
+                        raise
+                    logger.info("Submission job cancelled; continuing shared queue source=%s message=%s", *key)
+                except Exception:
+                    logger.exception("Unexpected submission worker error source=%s message=%s; continuing queue.", *key)
+                finally:
+                    if self._jobs.get(key) is task:
+                        self._jobs.pop(key, None)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._submission_worker_task is asyncio.current_task():
+                self._submission_worker_task = None
+                if self.user_client and self.rename_bot_id and self._submission_items:
+                    self._ensure_submission_worker()
+
+    async def _retry_after_delay(self, source_id: int, message_id: int, delay: float):
+        try:
+            await asyncio.sleep(delay)
+            job = await db.get_job(source_id, message_id)
+            if job and job.get("status") == "pending":
+                config = await db.get_channel_config(source_id)
+                if config and config.get("thumbnail"):
+                    self._enqueue_job(source_id, message_id, job.get("media_metadata"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not requeue safe preflight retry source=%s message=%s", source_id, message_id)
+
+    async def _persist_output_reply_id(self, source_id: int, message_id: int, reply_id: int):
+        try:
+            await db.add_output_reply_id(source_id, message_id, reply_id)
+        except Exception:
+            logger.exception("Could not persist rename-bot output reply anchor source=%s message=%s reply=%s", source_id, message_id, reply_id)
 
     def _launch_job(self, key: tuple[int, int], source_id: int, message_id: int):
-        current = self._jobs.get(key)
-        if current and not current.done():
-            return
-        task = asyncio.create_task(self._process_job(source_id, message_id), name=f"rename:{source_id}:{message_id}")
-        self._jobs[key] = task
-        task.add_done_callback(
-            lambda completed, job_key=key: self._jobs.pop(job_key, None)
-            if self._jobs.get(job_key) is completed else None
-        )
+        self._enqueue_job(source_id, message_id)
 
     async def resume_pending_jobs(self):
         if not self.user_client:
@@ -218,15 +582,43 @@ class RenameRuntime:
             config = await db.get_channel_config(source_id)
             if not config or not config.get("thumbnail"):
                 continue
-            key = (source_id, int(job["source_message_id"]))
-            self._launch_job(key, *key)
+            self._enqueue_job(source_id, int(job["source_message_id"]), job.get("media_metadata"))
+
+        output_jobs = await db.get_output_jobs()
+        async for job in output_jobs:
+            source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
+            config = await db.get_channel_config(source_id)
+            if not config or not config.get("thumbnail"):
+                logger.error("Cannot restore output tracking: source=%s message=%s has no saved thumbnail.", source_id, message_id)
+                continue
+            context = self._register_output_waiter(job)
+            self._ensure_output_task(job, config, context)
+        await self._recover_recent_outputs()
 
     async def cancel_active(self) -> bool:
         active = [task for task in self._jobs.values() if not task.done()]
-        if not active:
+        output = [(key, task) for key, task in self._output_tasks.items() if not task.done()]
+        queued = list(self._submission_items)
+        retry_tasks = [task for task in self._retry_tasks if not task.done()]
+        if not active and not output and not queued and not retry_tasks:
             return False
         for task in active:
             task.cancel()
+        for key, task in output:
+            await db.update_job(key[0], key[1], status="failed", stage="cancelled", error="Output tracking cancelled by administrator.")
+            task.cancel()
+        for item in queued:
+            await db.update_job(item["source_id"], item["message_id"], status="failed", stage="cancelled", error="Queued submission cancelled by administrator.")
+        self._submission_items.clear()
+        self._queued_keys.clear()
+        for task in retry_tasks:
+            retry_key = self._retry_job_keys.get(task)
+            if retry_key:
+                await db.update_job(retry_key[0], retry_key[1], status="failed", stage="cancelled", error="Scheduled retry cancelled by administrator.")
+            task.cancel()
+        tasks = active + [task for _, task in output] + retry_tasks
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         return True
 
     async def _next_rename_message(
@@ -246,8 +638,7 @@ class RenameRuntime:
                 continue
             if after_message_id is not None and int(getattr(message, "id", 0)) <= int(after_message_id):
                 continue
-            body = message.text or message.caption or ""
-            if re.search(r"auto[\s-]*delete\s+notice", body, re.IGNORECASE):
+            if self._is_auto_delete_notice(message):
                 logger.debug("Ignoring rename-bot auto-delete notice message_id=%s", getattr(message, "id", None))
                 continue
             reply_to_id = self._reply_to_message_id(message)
@@ -422,88 +813,75 @@ class RenameRuntime:
                 "callback_submitting",
                 callback_attempted_at=datetime.now(timezone.utc),
                 callback_attempt_count=1,
+                expected_filename=new_filename,
+                output_reply_ids=[int(value) for value in (getattr(sent_media, "id", None), getattr(filename_reply, "id", None), getattr(menu, "id", None)) if value is not None],
             )
+            output_context = self._register_output_waiter(
+                {
+                    "source_channel_id": source_id,
+                    "source_message_id": source_message_id,
+                    "expected_filename": new_filename,
+                    "rename_bot_media_message_id": getattr(sent_media, "id", None),
+                    "filename_message_id": getattr(filename_reply, "id", None),
+                    "rename_bot_menu_message_id": getattr(menu, "id", None),
+                },
+                expected_filename=new_filename,
+                reply_ids=[getattr(sent_media, "id", None), getattr(filename_reply, "id", None), getattr(menu, "id", None)],
+            )
+            callback_unknown = False
             try:
                 await self.user_client.request_callback_answer(
                     chat_id=self.rename_bot_id,
                     message_id=menu.id,
                     callback_data=second_button.callback_data,
-                    timeout=30,
+                    timeout=RENAME_RESPONSE_TIMEOUT,
                 )
             except BotResponseTimeout:
-                # The action may have succeeded even though the callback answer timed
-                # out. Never submit that callback again; wait for the resulting media.
-                logger.warning("Rename-bot callback answer timed out for source=%s/%s; waiting without retrying the callback.", source_id, source_message_id)
+                # The click may have been accepted despite the missing callback answer.
+                # Fence it as uncertain, keep tracking output, and never click again.
+                logger.warning("Rename-bot callback acknowledgement timed out for source=%s/%s; continuing queue without retrying.", source_id, source_message_id)
                 await self._advance_job_stage(
                     source_id,
                     source_message_id,
                     "callback_submitting",
                     "callback_unknown",
+                    status="submission_unknown",
                     callback_outcome="unknown_after_timeout",
+                    submitted_at=datetime.now(timezone.utc),
                 )
-                callback_stage = "callback_unknown"
+                callback_unknown = True
+            except Exception as exc:
+                # Network/RPC failure after issuing a non-idempotent callback is
+                # ambiguous too; do not repeat it or block later queued submissions.
+                logger.exception("Rename-bot callback result is uncertain for source=%s/%s.", source_id, source_message_id)
+                await self._advance_job_stage(
+                    source_id,
+                    source_message_id,
+                    "callback_submitting",
+                    "callback_unknown",
+                    status="submission_unknown",
+                    callback_outcome=f"unknown_after_error: {str(exc)[:300]}",
+                    submitted_at=datetime.now(timezone.utc),
+                )
+                callback_unknown = True
             else:
                 await self._advance_job_stage(
                     source_id,
                     source_message_id,
                     "callback_submitting",
-                    "callback_submitted",
+                    "submitted",
+                    status="submitted",
                     callback_outcome="acknowledged",
                     callback_completed_at=datetime.now(timezone.utc),
+                    submitted_at=datetime.now(timezone.utc),
                 )
-                callback_stage = "callback_submitted"
-
-            while True:
-                try:
-                    candidate = await self._next_rename_message(deadline, after_message_id=int(menu.id))
-                except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        "Timed out waiting for the renamed video/document from the rename bot; auto-delete notices were ignored."
-                    ) from exc
-                if candidate.video or candidate.document:
-                    media = candidate.video or candidate.document
-                    output_filename = getattr(media, "file_name", None)
-                    reply_to_id = self._reply_to_message_id(candidate)
-                    allowed_reply_ids = {
-                        int(value)
-                        for value in (getattr(menu, "id", None), getattr(filename_reply, "id", None), getattr(sent_media, "id", None))
-                        if value is not None
-                    }
-                    filename_matches = bool(
-                        output_filename
-                        and os.path.basename(output_filename.replace("\\", "/")).casefold()
-                        == os.path.basename(new_filename.replace("\\", "/")).casefold()
-                    )
-                    if reply_to_id is not None and reply_to_id not in allowed_reply_ids and not filename_matches:
-                        logger.warning(
-                            "Ignoring unrelated rename-bot media %s (reply_to=%s) while waiting for %s for source=%s/%s.",
-                            output_filename or "<no filename>",
-                            reply_to_id,
-                            new_filename,
-                            source_id,
-                            source_message_id,
-                        )
-                        continue
-                    if output_filename and not filename_matches and reply_to_id not in allowed_reply_ids:
-                        logger.warning(
-                            "Ignoring rename-bot media with unexpected filename %s while waiting for %s for source=%s/%s.",
-                            output_filename,
-                            new_filename,
-                            source_id,
-                            source_message_id,
-                        )
-                        continue
-                    await self._advance_job_stage(
-                        source_id,
-                        source_message_id,
-                        callback_stage,
-                        "final_received",
-                        rename_bot_message_id=candidate.id,
-                    )
-                    return candidate, new_filename
-                body = candidate.text or candidate.caption or ""
-                if re.search(r"error|failed|invalid", body, re.IGNORECASE):
-                    raise RuntimeError(f"Rename bot reported an error: {body[:500]}")
+            return {
+                "source_id": source_id,
+                "message_id": source_message_id,
+                "expected_filename": new_filename,
+                "context": output_context,
+                "submission_unknown": callback_unknown,
+            }
 
     async def _publish_result(self, final_message, output_id: int, thumbnail: bytes | None, expected_filename: str):
         video_media = final_message.video
@@ -565,6 +943,7 @@ class RenameRuntime:
             return uploaded
 
     async def _process_job(self, source_id: int, message_id: int):
+        key = (int(source_id), int(message_id))
         try:
             job = await db.get_job(source_id, message_id)
             if not job:
@@ -584,49 +963,31 @@ class RenameRuntime:
             source_message = await self.user_client.get_messages(source_id, message_id)
             if not source_message or not (source_message.video or source_message.document):
                 raise RuntimeError("Source message is no longer available or is not a video/document.")
-            final_message, new_filename = await self._rename_conversation(source_message, config)
-            await self._advance_job_stage(
+            submission = await self._rename_conversation(source_message, config)
+            job["expected_filename"] = submission["expected_filename"]
+            self._ensure_output_task(job, config, submission["context"])
+            logger.info(
+                "Rename submission %s source=%s message=%s filename=%s; output tracking continues independently.",
+                "unconfirmed" if submission["submission_unknown"] else "acknowledged",
                 source_id,
                 message_id,
-                "final_received",
-                "publishing",
-                status="publishing",
-                final_filename=new_filename,
-                rename_bot_message_id=final_message.id,
+                submission["expected_filename"],
             )
-            # Once publishing begins, interrupted jobs are fenced as failed on restart to avoid blind duplicate sends.
-            output_id = int(job["output_channel_id"])
-            try:
-                sent = await self._publish_result(final_message, output_id, config.get("thumbnail"), new_filename)
-            except Exception:
-                logger.exception(
-                    "Failed to upload renamed media to output channel=%s for source=%s/%s.",
-                    output_id,
-                    source_id,
-                    message_id,
-                )
-                raise
-            await db.update_job(
-                source_id,
-                message_id,
-                status="completed",
-                output_message_id=sent.id,
-                error=None,
-                completed_at=datetime.now(timezone.utc),
-            )
-            logger.info("Completed rename job for source=%s message=%s as %s", source_id, message_id, new_filename)
-            if self.bot_client and ADMINS:
-                try:
-                    await self.bot_client.send_message(ADMINS[0], f"Rename complete: <code>{new_filename}</code>\nSource: <code>{source_id}/{message_id}</code>")
-                except Exception:
-                    logger.debug("Could not send job-completion notification to the primary administrator.", exc_info=True)
         except asyncio.CancelledError:
             current = await db.get_job(source_id, message_id)
             stage = current.get("stage") if current else None
-            fields = {"status": "failed", "error": "Cancelled by administrator."}
-            if stage != "publishing":
-                fields["stage"] = "cancelled"
-            await db.update_job(source_id, message_id, **fields)
+            if stage == "preflight" and self._stopping_session:
+                await db.update_job(source_id, message_id, status="pending", stage="preflight", error="Session stopped before any rename-bot action; safe to resume.")
+            elif stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
+                if self._stopping_session:
+                    await db.update_job(source_id, message_id, status="submission_unknown", stage="callback_unknown", error="Session stopped during callback; output tracking will be restored without resubmission.")
+                else:
+                    await db.update_job(source_id, message_id, status="failed", stage="cancelled", error="Cancelled by administrator during callback.")
+                    context = self._output_waiters.pop(key)
+                    if not context["future"].done():
+                        context["future"].cancel()
+            else:
+                await db.update_job(source_id, message_id, status="failed", stage="cancelled", error="Cancelled by administrator.")
             raise
         except Exception as exc:
             logger.exception("Rename job failed for source=%s message=%s", source_id, message_id)
@@ -634,6 +995,12 @@ class RenameRuntime:
             current = await db.get_job(source_id, message_id)
             attempt_count = int(current.get("attempts", 0)) if current else MAX_RENAME_ATTEMPTS
             stage = current.get("stage") if current else "publishing"
+            if stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
+                await db.update_job(source_id, message_id, status="submission_unknown", stage="callback_unknown", error=error, submitted_at=datetime.now(timezone.utc))
+                config = await db.get_channel_config(source_id)
+                if current and config:
+                    self._ensure_output_task(current, config, self._output_waiters[key])
+                return
             # Once the rename bot has seen any side effect, restarting the full
             # conversation can rename the same media again or repeat its callback.
             can_retry = self._safe_to_retry(stage, attempt_count)
@@ -646,8 +1013,11 @@ class RenameRuntime:
             )
             if can_retry:
                 delay = min(2 ** max(attempt_count, 1), 30)
-                key = (source_id, message_id)
-                asyncio.get_running_loop().call_later(delay, self._launch_job, key, source_id, message_id)
+                retry = asyncio.create_task(self._retry_after_delay(source_id, message_id, delay), name=f"rename-retry:{source_id}:{message_id}")
+                self._retry_tasks.add(retry)
+                self._retry_job_keys[retry] = key
+                retry.add_done_callback(self._retry_tasks.discard)
+                retry.add_done_callback(lambda completed: self._retry_job_keys.pop(completed, None))
 
 
 rename_runtime = RenameRuntime()
