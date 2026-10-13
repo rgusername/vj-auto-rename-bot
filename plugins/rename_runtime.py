@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from collections import deque
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters, enums
@@ -24,11 +25,13 @@ from config import (
 )
 from plugins.database import db
 from plugins.filename_utils import (
-    append_username,
     extract_original_filename,
     extract_video_metadata,
+    format_standardized_filename,
+    normalize_filename_key,
     quality_priority,
     sanitize_filename,
+    title_similarity,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,9 @@ _VIDEO_EXTENSIONS = frozenset({
     ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg",
     ".ogv", ".ts", ".webm", ".wmv",
 })
+_UNMATCHED_OUTPUT_MAX = 100
+_UNMATCHED_OUTPUT_TTL_SECONDS = 3600
+_CAPTION_UNSET = object()
 
 
 def select_second_inline_button(markup):
@@ -79,6 +85,7 @@ class RenameRuntime:
         self._background_db_tasks: set[asyncio.Task] = set()
         self._output_waiters: dict[tuple[int, int], dict] = {}
         self._output_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._unmatched_outputs: deque[dict] = deque()
         self._stopping_session = False
         self._handler_group = 70
 
@@ -206,6 +213,7 @@ class RenameRuntime:
         self._queued_keys.clear()
         self._submission_items.clear()
         self._submission_event.clear()
+        self._unmatched_outputs.clear()
         for context in self._output_waiters.values():
             future = context.get("future")
             if future and not future.done():
@@ -240,8 +248,10 @@ class RenameRuntime:
             logger.debug("Ignoring rename-bot auto-delete notice message_id=%s", getattr(message, "id", None))
             return
         if message.video or message.document:
-            if not self._route_output_message(message):
-                logger.warning("Ignoring unmatched rename-bot media message_id=%s filename=%s", getattr(message, "id", None), self._media_filename(message))
+            if self._route_output_message(message):
+                self._reconcile_unmatched_outputs()
+            else:
+                self._remember_unmatched_output(message)
             return
         reply_to = self._reply_to_message_id(message)
         if body and re.search(r"error|failed|invalid", body, re.IGNORECASE) and reply_to is not None:
@@ -274,7 +284,14 @@ class RenameRuntime:
         name = getattr(media, "file_name", None) if media else None
         return os.path.basename(name.replace("\\", "/")) if isinstance(name, str) and name else None
 
-    def _register_output_waiter(self, job: dict, expected_filename: str | None = None, reply_ids=None) -> dict:
+    def _register_output_waiter(
+        self,
+        job: dict,
+        expected_filename: str | None = None,
+        reply_ids=None,
+        *,
+        accepting_output: bool | None = None,
+    ) -> dict:
         source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
         key = (source_id, message_id)
         context = self._output_waiters.get(key)
@@ -282,6 +299,11 @@ class RenameRuntime:
             if expected_filename:
                 context["expected_filename"] = expected_filename
             context["reply_ids"].update(int(value) for value in (reply_ids or []) if value is not None)
+            context["media_metadata"] = dict(job.get("media_metadata") or context.get("media_metadata") or {})
+            if accepting_output is not None:
+                context["accepting_output"] = accepting_output
+            if context.get("accepting_output"):
+                self._reconcile_unmatched_outputs()
             return context
         anchors = list(job.get("output_reply_ids", []))
         anchors.extend([
@@ -298,53 +320,193 @@ class RenameRuntime:
             "future": asyncio.get_running_loop().create_future(),
             "error_event": asyncio.Event(),
             "submitted_order": job.get("submitted_at") or job.get("created_at") or datetime.now(timezone.utc),
+            "job_id": job.get("job_id") or f"{source_id}:{message_id}",
+            "source_channel_number": job.get("source_channel_number"),
+            "output_channel_id": int(job["output_channel_id"]) if job.get("output_channel_id") is not None else None,
+            "original_filename": job.get("original_filename"),
+            "original_caption": job.get("original_caption"),
+            "media_metadata": dict(job.get("media_metadata") or {}),
+            "accepting_output": accepting_output if accepting_output is not None else job.get("status") in {"submitted", "submission_unknown"},
         }
         self._output_waiters[key] = context
+        if context["accepting_output"]:
+            self._reconcile_unmatched_outputs()
         return context
 
-    def _route_output_message(self, message) -> bool:
+    @staticmethod
+    def _metadata_match_score(source_metadata: dict | None, output_metadata: dict | None) -> int | None:
+        source_metadata = source_metadata or {}
+        output_metadata = output_metadata or {}
+        source_episode, output_episode = source_metadata.get("episode"), output_metadata.get("episode")
+        if source_episode is None or output_episode is None or int(source_episode) != int(output_episode):
+            return None
+        source_season, output_season = source_metadata.get("season"), output_metadata.get("season")
+        if source_season != output_season:
+            return None
+        source_quality, output_quality = source_metadata.get("quality"), output_metadata.get("quality")
+        if source_quality is not None and source_quality != output_quality:
+            return None
+        similarity, overlap = title_similarity(source_metadata.get("title_key"), output_metadata.get("title_key"))
+        if not overlap or similarity < 0.3:
+            return None
+        return 50 + round(similarity * 10) + (5 if source_quality is not None and source_quality == output_quality else 0)
+
+    def _route_output_message(self, message, *, allow_inactive: bool = False) -> bool:
         if not (message.video or message.document):
             return False
         reply_to = self._reply_to_message_id(message)
         filename = self._media_filename(message)
+        output_metadata = extract_video_metadata(filename, getattr(message, "caption", None))
+        eligible_waiters = sum(
+            1 for context in self._output_waiters.values()
+            if context.get("accepting_output") and not context["future"].done()
+        )
         candidates = []
         for key, context in self._output_waiters.items():
             future = context["future"]
-            if future.done():
+            if future.done() or (not allow_inactive and not context.get("accepting_output")):
                 continue
             anchor_floor = max(context["reply_ids"], default=0)
             if int(getattr(message, "id", 0)) <= anchor_floor:
                 continue
             reply_match = reply_to is not None and reply_to in context["reply_ids"]
             expected = context.get("expected_filename")
-            filename_match = bool(
-                filename and expected
-                and filename.casefold() == os.path.basename(expected.replace("\\", "/")).casefold()
+            exact_expected = bool(filename and expected and normalize_filename_key(filename) == normalize_filename_key(expected))
+            exact_original = bool(
+                filename and context.get("original_filename")
+                and normalize_filename_key(filename) == normalize_filename_key(context["original_filename"])
             )
-            if reply_match or filename_match or (not filename and reply_to is None and len(self._output_waiters) == 1):
-                score = (3 if filename_match else 0) + (2 if reply_match else 0)
+            metadata_score = self._metadata_match_score(context.get("media_metadata"), output_metadata)
+            if reply_match or exact_expected or exact_original or metadata_score is not None or (not filename and reply_to is None and eligible_waiters == 1):
+                score = 100 if reply_match else 90 if exact_expected else 85 if exact_original else metadata_score or 10
                 candidates.append((score, context["submitted_order"], key, context))
         if not candidates:
             return False
         candidates.sort(key=lambda item: (-item[0], item[1]))
         if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
             logger.error(
-                "Rename-bot output cannot be safely associated for filename=%s (ambiguous source jobs=%s); leaving it unassigned rather than publishing to the wrong job.",
+                "Rename-bot output cannot be safely associated for filename=%s (ambiguous jobs=%s); leaving it unassigned rather than publishing to the wrong destination.",
                 filename or "<no filename>",
-                [(item[2][0], item[2][1]) for item in candidates if item[0] == candidates[0][0]],
+                [
+                    {
+                        "job_id": item[3].get("job_id"),
+                        "channel": item[3].get("source_channel_number"),
+                        "source": item[2][0],
+                        "message": item[2][1],
+                        "destination": item[3].get("output_channel_id"),
+                    }
+                    for item in candidates if item[0] == candidates[0][0]
+                ],
             )
             return False
         context = candidates[0][3]
         context["future"].set_result(message)
         context["output_message_id"] = int(message.id)
+        context["output_metadata"] = output_metadata
+        self._schedule_db_task(
+            self._persist_matched_output(context, message, output_metadata),
+            f"match:{context['source_id']}:{context['message_id']}:{message.id}",
+        )
         logger.info(
-            "Matched rename-bot output message=%s to source=%s message=%s filename=%s.",
+            "Matched rename-bot output message=%s to Channel %s source=%s message=%s filename=%s metadata=%s.",
             message.id,
+            context.get("source_channel_number", "?"),
             context["source_id"],
             context["message_id"],
             filename or context.get("expected_filename"),
+            output_metadata,
         )
         return True
+
+    async def _persist_matched_output(self, context: dict, message, metadata: dict):
+        try:
+            await db.update_job(
+                context["source_id"],
+                context["message_id"],
+                rename_bot_output_message_id=int(message.id),
+                actual_output_filename=self._media_filename(message),
+                actual_output_caption=getattr(message, "caption", None),
+                output_metadata=metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist matched rename-bot output for job=%s message=%s.",
+                context["job_id"],
+                getattr(message, "id", None),
+            )
+
+    def _schedule_db_task(self, coroutine, name: str):
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_db_tasks.add(task)
+        task.add_done_callback(self._background_db_tasks.discard)
+        return task
+
+    def _prune_unmatched_outputs(self):
+        now = asyncio.get_running_loop().time()
+        kept = [
+            item for item in self._unmatched_outputs
+            if now - item["received_at"] <= _UNMATCHED_OUTPUT_TTL_SECONDS
+        ]
+        expired = len(self._unmatched_outputs) - len(kept)
+        self._unmatched_outputs = deque(kept)
+        if expired:
+            logger.info("Expired %s unmatched rename-bot output item(s) beyond the retention window.", expired)
+
+    def _remember_unmatched_output(self, message):
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        message_date = getattr(message, "date", None)
+        received_at = now
+        if isinstance(message_date, datetime):
+            if message_date.tzinfo is None:
+                message_date = message_date.replace(tzinfo=timezone.utc)
+            age = max((datetime.now(timezone.utc) - message_date.astimezone(timezone.utc)).total_seconds(), 0)
+            if age > _UNMATCHED_OUTPUT_TTL_SECONDS:
+                logger.debug("Skipping stale historical rename output message_id=%s age=%ss.", getattr(message, "id", None), round(age))
+                return
+            received_at = now - age
+        self._prune_unmatched_outputs()
+        message_id = int(getattr(message, "id", 0))
+        if any(int(getattr(item["message"], "id", 0)) == message_id for item in self._unmatched_outputs):
+            return
+        if len(self._unmatched_outputs) >= _UNMATCHED_OUTPUT_MAX:
+            oldest = self._unmatched_outputs.popleft()
+            logger.warning("Dropping unmatched output message_id=%s due to bounded queue capacity.", getattr(oldest["message"], "id", None))
+        filename = self._media_filename(message)
+        metadata = extract_video_metadata(filename, getattr(message, "caption", None))
+        possible = [
+            {
+                "channel": context.get("source_channel_number"),
+                "source": context["source_id"],
+                "message": context["message_id"],
+                "episode": (context.get("media_metadata") or {}).get("episode"),
+                "quality": (context.get("media_metadata") or {}).get("quality"),
+            }
+            for context in self._output_waiters.values()
+            if context.get("accepting_output") and not context["future"].done()
+        ]
+        self._unmatched_outputs.append({
+            "message": message,
+            "metadata": metadata,
+            "received_at": received_at,
+        })
+        logger.warning(
+            "Stored unmatched rename-bot media message=%s filename=%s metadata=%s possible_jobs=%s; retained for reconciliation.",
+            message_id,
+            filename,
+            metadata,
+            possible,
+        )
+
+    def _reconcile_unmatched_outputs(self):
+        if not self._unmatched_outputs:
+            return
+        self._prune_unmatched_outputs()
+        pending = list(self._unmatched_outputs)
+        self._unmatched_outputs.clear()
+        for item in pending:
+            if not self._route_output_message(item["message"]):
+                self._unmatched_outputs.append(item)
 
     def _ensure_output_task(self, job: dict, config: dict, context: dict):
         key = (int(job["source_channel_id"]), int(job["source_message_id"]))
@@ -398,21 +560,53 @@ class RenameRuntime:
             output_id = int(job["output_channel_id"])
             expected_filename = context.get("expected_filename") or job.get("expected_filename") or job.get("final_filename") or self._media_filename(final_message)
             try:
-                uploaded = await self._publish_result(final_message, output_id, config.get("thumbnail"), expected_filename)
+                uploaded = await self._publish_result(
+                    final_message,
+                    output_id,
+                    config.get("thumbnail"),
+                    expected_filename,
+                    caption=job.get("original_caption") if job.get("original_caption") is not None else _CAPTION_UNSET,
+                )
             except Exception as exc:
-                logger.exception("Output upload failed channel=%s source=%s message=%s", output_id, source_id, message_id)
-                await db.update_job(source_id, message_id, status="failed", stage="publishing", error=str(exc)[:1000])
+                logger.exception(
+                    "Output upload failed job=%s Channel %s source=%s message=%s destination=%s",
+                    job.get("job_id") or f"{source_id}:{message_id}",
+                    job.get("source_channel_number", "?"),
+                    source_id,
+                    message_id,
+                    output_id,
+                )
+                await db.update_job(
+                    source_id,
+                    message_id,
+                    status="failed",
+                    publication_status="failed",
+                    stage="publishing",
+                    error=str(exc)[:1000],
+                )
                 return
             await db.update_job(
                 source_id,
                 message_id,
                 status="completed",
+                publication_status="published",
                 stage="completed",
                 output_message_id=uploaded.id,
+                destination_message_id=uploaded.id,
+                rename_bot_output_message_id=int(final_message.id),
                 error=None,
                 completed_at=datetime.now(timezone.utc),
             )
-            logger.info("Completed rename job source=%s message=%s output_channel=%s output_message=%s filename=%s", source_id, message_id, output_id, uploaded.id, expected_filename)
+            logger.info(
+                "Completed rename job=%s Channel %s source=%s message=%s output_channel=%s destination_message=%s filename=%s",
+                job.get("job_id") or f"{source_id}:{message_id}",
+                job.get("source_channel_number", "?"),
+                source_id,
+                message_id,
+                output_id,
+                uploaded.id,
+                expected_filename,
+            )
             if self.bot_client and ADMINS:
                 try:
                     await self.bot_client.send_message(ADMINS[0], f"Rename complete: <code>{expected_filename}</code>\nSource: <code>{source_id}/{message_id}</code>")
@@ -424,10 +618,11 @@ class RenameRuntime:
             logger.exception("Output tracking failed source=%s message=%s", source_id, message_id)
             current = await db.get_job(source_id, message_id)
             if current and current.get("status") in {"submitted", "submission_unknown"}:
-                await db.update_job(source_id, message_id, status="failed", stage="rename_bot_error", error=str(exc)[:1000])
+                await db.update_job(source_id, message_id, status="failed", submission_status="failed", stage="rename_bot_error", error=str(exc)[:1000])
         finally:
             if self._output_waiters.get(key) is context:
                 self._output_waiters.pop(key, None)
+            self._reconcile_unmatched_outputs()
 
     async def _recover_recent_outputs(self):
         if not self._output_waiters or not self.user_client or not self.rename_bot_id:
@@ -438,7 +633,8 @@ class RenameRuntime:
         try:
             async for message in history(self.rename_bot_id, limit=1000):
                 if message.video or message.document:
-                    self._route_output_message(message)
+                    if not self._route_output_message(message):
+                        self._remember_unmatched_output(message)
                 elif self._is_auto_delete_notice(message):
                     await self._on_rename_bot_message(self.user_client, message)
                 if not self._output_waiters:
@@ -452,16 +648,24 @@ class RenameRuntime:
         try:
             source_id, message_id = int(message.chat.id), int(message.id)
             media = message.video or message.document
-            media_metadata = extract_video_metadata(getattr(media, "file_name", None))
+            original_filename = getattr(media, "file_name", None)
+            original_caption = getattr(message, "caption", None)
+            media_metadata = extract_video_metadata(original_filename, original_caption)
             async with self._accept_lock:
                 config = await db.get_channel_config(source_id)
                 if not config:
                     return
+                username = await db.get_username()
+                expected_filename = format_standardized_filename(username, media_metadata, original_filename)
                 created = await db.create_job(
                     source_id,
                     message_id,
                     config["output_channel_id"],
                     media_metadata=media_metadata,
+                    channel_number=config.get("channel_number"),
+                    original_filename=original_filename,
+                    original_caption=original_caption,
+                    expected_filename=expected_filename,
                 )
         except Exception:
             logger.exception("Could not load source configuration or record source=%s message=%s", message.chat.id, message.id)
@@ -469,7 +673,16 @@ class RenameRuntime:
         if not created:
             logger.info("Ignoring duplicate source job source=%s message=%s", source_id, message_id)
             return
-        logger.info("Accepted rename job source=%s message=%s status=queued metadata=%s", source_id, message_id, media_metadata)
+        logger.info(
+            "Accepted rename job=%s Channel %s source=%s message=%s destination=%s status=queued metadata=%s expected_filename=%s",
+            f"{source_id}:{message_id}",
+            config.get("channel_number", "?"),
+            source_id,
+            message_id,
+            config["output_channel_id"],
+            media_metadata,
+            expected_filename,
+        )
         if config.get("thumbnail"):
             self._enqueue_job(source_id, message_id, media_metadata)
 
@@ -605,16 +818,16 @@ class RenameRuntime:
         for task in active:
             task.cancel()
         for key, task in output:
-            await db.update_job(key[0], key[1], status="failed", stage="cancelled", error="Output tracking cancelled by administrator.")
+            await db.update_job(key[0], key[1], status="failed", publication_status="failed", stage="cancelled", error="Output tracking cancelled by administrator.")
             task.cancel()
         for item in queued:
-            await db.update_job(item["source_id"], item["message_id"], status="failed", stage="cancelled", error="Queued submission cancelled by administrator.")
+            await db.update_job(item["source_id"], item["message_id"], status="failed", submission_status="failed", stage="cancelled", error="Queued submission cancelled by administrator.")
         self._submission_items.clear()
         self._queued_keys.clear()
         for task in retry_tasks:
             retry_key = self._retry_job_keys.get(task)
             if retry_key:
-                await db.update_job(retry_key[0], retry_key[1], status="failed", stage="cancelled", error="Scheduled retry cancelled by administrator.")
+                await db.update_job(retry_key[0], retry_key[1], status="failed", submission_status="failed", stage="cancelled", error="Scheduled retry cancelled by administrator.")
             task.cancel()
         tasks = active + [task for _, task in output] + retry_tasks
         if tasks:
@@ -682,11 +895,20 @@ class RenameRuntime:
             return message.document.file_name
         return None
 
-    async def _rename_conversation(self, source_message, config: dict) -> tuple[object, str]:
+    async def _rename_conversation(self, source_message, config: dict, job: dict | None = None, output_context: dict | None = None) -> dict:
         if not self.user_client or not self.rename_bot_id:
             raise RuntimeError("The logged-in account or rename bot is unavailable.")
         source_id = int(source_message.chat.id)
         source_message_id = int(source_message.id)
+        job = job or {
+            "source_channel_id": source_id,
+            "source_message_id": source_message_id,
+            "output_channel_id": config.get("output_channel_id"),
+            "original_filename": self._source_filename(source_message),
+            "original_caption": getattr(source_message, "caption", None),
+            "media_metadata": extract_video_metadata(self._source_filename(source_message), getattr(source_message, "caption", None)),
+        }
+        output_context = output_context or self._register_output_waiter(job, accepting_output=False)
         async with self._conversation_lock:
             while not self._rename_messages.empty():
                 try:
@@ -753,12 +975,25 @@ class RenameRuntime:
             )
 
             text = prompt.text or prompt.caption or ""
-            original = extract_original_filename(text, self._source_filename(source_message))
+            original = extract_original_filename(text, job.get("original_filename") or self._source_filename(source_message))
             if not original:
                 raise RuntimeError("The rename bot did not provide a usable original filename.")
             username = await db.get_username()
-            new_filename = append_username(original, username)
-            await self._advance_job_stage(source_id, source_message_id, "filename_prompt_received", "filename_sending")
+            metadata = job.get("media_metadata") or extract_video_metadata(original, getattr(source_message, "caption", None))
+            new_filename = job.get("expected_filename") or format_standardized_filename(username, metadata, original)
+            if not new_filename:
+                raise RuntimeError("The source filename is unavailable; refusing to invent a rename target.")
+            output_context["expected_filename"] = new_filename
+            output_context["original_filename"] = job.get("original_filename") or original
+            output_context["original_caption"] = job.get("original_caption", getattr(source_message, "caption", None))
+            output_context["media_metadata"] = dict(metadata)
+            await self._advance_job_stage(
+                source_id,
+                source_message_id,
+                "filename_prompt_received",
+                "filename_sending",
+                expected_filename=new_filename,
+            )
             filename_reply = await self._bounded_flood_retry(
                 self.user_client.send_message,
                 self.rename_bot_id,
@@ -811,23 +1046,27 @@ class RenameRuntime:
                 source_message_id,
                 "menu_received",
                 "callback_submitting",
+                submission_status="submitting",
                 callback_attempted_at=datetime.now(timezone.utc),
                 callback_attempt_count=1,
                 expected_filename=new_filename,
                 output_reply_ids=[int(value) for value in (getattr(sent_media, "id", None), getattr(filename_reply, "id", None), getattr(menu, "id", None)) if value is not None],
+                expected_output_message_ids=[int(value) for value in (getattr(sent_media, "id", None), getattr(filename_reply, "id", None), getattr(menu, "id", None)) if value is not None],
             )
+            job.update({
+                "expected_filename": new_filename,
+                "rename_bot_media_message_id": getattr(sent_media, "id", None),
+                "filename_message_id": getattr(filename_reply, "id", None),
+                "rename_bot_menu_message_id": getattr(menu, "id", None),
+            })
             output_context = self._register_output_waiter(
-                {
-                    "source_channel_id": source_id,
-                    "source_message_id": source_message_id,
-                    "expected_filename": new_filename,
-                    "rename_bot_media_message_id": getattr(sent_media, "id", None),
-                    "filename_message_id": getattr(filename_reply, "id", None),
-                    "rename_bot_menu_message_id": getattr(menu, "id", None),
-                },
+                job,
                 expected_filename=new_filename,
                 reply_ids=[getattr(sent_media, "id", None), getattr(filename_reply, "id", None), getattr(menu, "id", None)],
+                accepting_output=True,
             )
+            output_context["submitted_order"] = datetime.now(timezone.utc)
+            self._reconcile_unmatched_outputs()
             callback_unknown = False
             try:
                 await self.user_client.request_callback_answer(
@@ -846,6 +1085,7 @@ class RenameRuntime:
                     "callback_submitting",
                     "callback_unknown",
                     status="submission_unknown",
+                    submission_status="submission_unknown",
                     callback_outcome="unknown_after_timeout",
                     submitted_at=datetime.now(timezone.utc),
                 )
@@ -860,6 +1100,7 @@ class RenameRuntime:
                     "callback_submitting",
                     "callback_unknown",
                     status="submission_unknown",
+                    submission_status="submission_unknown",
                     callback_outcome=f"unknown_after_error: {str(exc)[:300]}",
                     submitted_at=datetime.now(timezone.utc),
                 )
@@ -871,6 +1112,7 @@ class RenameRuntime:
                     "callback_submitting",
                     "submitted",
                     status="submitted",
+                    submission_status="submitted",
                     callback_outcome="acknowledged",
                     callback_completed_at=datetime.now(timezone.utc),
                     submitted_at=datetime.now(timezone.utc),
@@ -883,7 +1125,15 @@ class RenameRuntime:
                 "submission_unknown": callback_unknown,
             }
 
-    async def _publish_result(self, final_message, output_id: int, thumbnail: bytes | None, expected_filename: str):
+    async def _publish_result(
+        self,
+        final_message,
+        output_id: int,
+        thumbnail: bytes | None,
+        expected_filename: str,
+        *,
+        caption=_CAPTION_UNSET,
+    ):
         video_media = final_message.video
         document_media = final_message.document
         media = video_media or document_media
@@ -905,12 +1155,13 @@ class RenameRuntime:
                 raise RuntimeError("Could not download the rename bot's final media for upload.")
             thumb = io.BytesIO(bytes(thumbnail))
             thumb.name = "thumbnail.jpg"
+            preserve_output_caption = caption is _CAPTION_UNSET
             send_options = {
-                "caption": final_message.caption or "",
+                "caption": (final_message.caption or "") if preserve_output_caption else (caption or ""),
                 "thumb": thumb,
                 "file_name": filename,
             }
-            caption_entities = getattr(final_message, "caption_entities", None)
+            caption_entities = getattr(final_message, "caption_entities", None) if preserve_output_caption else None
             if caption_entities:
                 send_options["caption_entities"] = caption_entities
 
@@ -949,10 +1200,20 @@ class RenameRuntime:
             if not job:
                 return
             if int(job.get("attempts", 0)) >= MAX_RENAME_ATTEMPTS:
-                await db.update_job(source_id, message_id, status="failed", error="Maximum processing attempts reached.")
+                await db.update_job(source_id, message_id, status="failed", submission_status="failed", error="Maximum processing attempts reached.")
                 return
             if not await db.claim_job(source_id, message_id):
                 return
+            output_context = self._register_output_waiter(job, accepting_output=False)
+            logger.info(
+                "Created in-memory output tracker and claimed persisted job=%s Channel %s source=%s message=%s destination=%s expected_filename=%s before rename-bot submission.",
+                job.get("job_id") or f"{source_id}:{message_id}",
+                job.get("source_channel_number", "?"),
+                source_id,
+                message_id,
+                job.get("output_channel_id"),
+                job.get("expected_filename") or "awaiting prompt filename",
+            )
         except Exception:
             logger.exception("Could not load or claim persisted rename job source=%s message=%s", source_id, message_id)
             return
@@ -963,7 +1224,7 @@ class RenameRuntime:
             source_message = await self.user_client.get_messages(source_id, message_id)
             if not source_message or not (source_message.video or source_message.document):
                 raise RuntimeError("Source message is no longer available or is not a video/document.")
-            submission = await self._rename_conversation(source_message, config)
+            submission = await self._rename_conversation(source_message, config, job, output_context)
             job["expected_filename"] = submission["expected_filename"]
             self._ensure_output_task(job, config, submission["context"])
             logger.info(
@@ -977,17 +1238,21 @@ class RenameRuntime:
             current = await db.get_job(source_id, message_id)
             stage = current.get("stage") if current else None
             if stage == "preflight" and self._stopping_session:
-                await db.update_job(source_id, message_id, status="pending", stage="preflight", error="Session stopped before any rename-bot action; safe to resume.")
+                await db.update_job(source_id, message_id, status="pending", submission_status="queued", stage="preflight", error="Session stopped before any rename-bot action; safe to resume.")
             elif stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
                 if self._stopping_session:
-                    await db.update_job(source_id, message_id, status="submission_unknown", stage="callback_unknown", error="Session stopped during callback; output tracking will be restored without resubmission.")
+                    await db.update_job(source_id, message_id, status="submission_unknown", submission_status="submission_unknown", stage="callback_unknown", error="Session stopped during callback; output tracking will be restored without resubmission.")
                 else:
-                    await db.update_job(source_id, message_id, status="failed", stage="cancelled", error="Cancelled by administrator during callback.")
+                    await db.update_job(source_id, message_id, status="failed", submission_status="failed", stage="cancelled", error="Cancelled by administrator during callback.")
                     context = self._output_waiters.pop(key)
                     if not context["future"].done():
                         context["future"].cancel()
             else:
-                await db.update_job(source_id, message_id, status="failed", stage="cancelled", error="Cancelled by administrator.")
+                await db.update_job(source_id, message_id, status="failed", submission_status="failed", stage="cancelled", error="Cancelled by administrator.")
+            if key in self._output_waiters and stage not in {"callback_submitting", "callback_unknown"}:
+                context = self._output_waiters.pop(key)
+                if not context["future"].done():
+                    context["future"].cancel()
             raise
         except Exception as exc:
             logger.exception("Rename job failed for source=%s message=%s", source_id, message_id)
@@ -996,7 +1261,15 @@ class RenameRuntime:
             attempt_count = int(current.get("attempts", 0)) if current else MAX_RENAME_ATTEMPTS
             stage = current.get("stage") if current else "publishing"
             if stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
-                await db.update_job(source_id, message_id, status="submission_unknown", stage="callback_unknown", error=error, submitted_at=datetime.now(timezone.utc))
+                await db.update_job(
+                    source_id,
+                    message_id,
+                    status="submission_unknown",
+                    submission_status="submission_unknown",
+                    stage="callback_unknown",
+                    error=error,
+                    submitted_at=datetime.now(timezone.utc),
+                )
                 config = await db.get_channel_config(source_id)
                 if current and config:
                     self._ensure_output_task(current, config, self._output_waiters[key])
@@ -1009,8 +1282,12 @@ class RenameRuntime:
                 message_id,
                 status="pending" if can_retry else "failed",
                 stage="preflight" if can_retry else stage,
+                submission_status="queued" if can_retry else "failed",
                 error=error,
             )
+            context = self._output_waiters.pop(key, None)
+            if context and not context["future"].done():
+                context["future"].cancel()
             if can_retry:
                 delay = min(2 ** max(attempt_count, 1), 30)
                 retry = asyncio.create_task(self._retry_after_delay(source_id, message_id, delay), name=f"rename-retry:{source_id}:{message_id}")
