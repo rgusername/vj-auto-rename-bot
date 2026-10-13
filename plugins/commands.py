@@ -108,7 +108,7 @@ async def set_channel(client, message):
         return await message.reply_text(f"Channel validation failed. Ensure the logged-in account can access both chats. Details: <code>{str(exc)[:300]}</code>")
 
     try:
-        await db.set_channel_config(source_id, output_id)
+        channel_number = await db.set_channel_config(source_id, output_id)
     except Exception:
         logger.exception("Could not persist source/output channel mapping.")
         return await message.reply_text("Database error: the channel mapping could not be saved.")
@@ -122,7 +122,7 @@ async def set_channel(client, message):
         # Let the listener register before the prompt can trigger a fast reply.
         await asyncio.sleep(0)
         await message.reply_text(
-            f"Mapping saved: <code>{source_id}</code> → <code>{output_id}</code>.\n"
+            f"Channel {channel_number} mapping saved: <code>{source_id}</code> → <code>{output_id}</code>.\n"
             "Now send the thumbnail photo for this source channel. Send /cancel to stop."
         )
         photo_message = await listener_task
@@ -143,7 +143,7 @@ async def set_channel(client, message):
         if not await db.set_channel_thumbnail(source_id, image_bytes):
             return await photo_message.reply_text("The mapping is no longer present. Please run /set again.")
         await rename_runtime.resume_pending_jobs()
-        await photo_message.reply_text(f"Saved thumbnail for source channel <code>{source_id}</code>.")
+        await photo_message.reply_text(f"Saved thumbnail for Channel {channel_number} (<code>{source_id}</code>).")
     except asyncio.TimeoutError:
         await message.reply_text("Timed out waiting for the thumbnail. The mapping is saved; send /set again to attach a thumbnail.")
     except Exception:
@@ -196,7 +196,8 @@ async def status(client, message):
     if mappings:
         for item in mappings:
             thumb = "thumbnail saved" if item.get("thumbnail") else "thumbnail missing"
-            lines.append(f"<code>{item['source_channel_id']}</code> → <code>{item['output_channel_id']}</code> ({thumb})")
+            channel_number = item.get("channel_number", "?")
+            lines.append(f"Channel {channel_number}: <code>{item['source_channel_id']}</code> → <code>{item['output_channel_id']}</code> ({thumb})")
     else:
         lines.append("None configured")
     lines.append("Jobs: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
