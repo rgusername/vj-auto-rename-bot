@@ -32,3 +32,4 @@ SESSION_OWNER_ID = int(environ.get("SESSION_OWNER_ID", "7622078787") or "0")
 RENAME_BOT_USERNAME = environ.get("RENAME_BOT_USERNAME", "Sitaratoons_Rename_bot").strip().lstrip("@")
 RENAME_RESPONSE_TIMEOUT = max(15, int(environ.get("RENAME_RESPONSE_TIMEOUT", "300")))
 MAX_RENAME_ATTEMPTS = max(1, min(5, int(environ.get("MAX_RENAME_ATTEMPTS", "3"))))
+QUALITY_PRIORITY_ENABLED = environ.get("QUALITY_PRIORITY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
