@@ -26,6 +26,7 @@ class Database:
         await self.configs.create_index("source_channel_id", unique=True)
         await self.jobs.create_index([("source_channel_id", 1), ("source_message_id", 1)], unique=True)
         await self.jobs.create_index("status")
+        await self.jobs.create_index([("status", 1), ("created_at", 1)])
 
     def new_user(self, user_id: int, name: str) -> dict:
         return {"id": int(user_id), "name": name, "session": None}
@@ -90,20 +91,23 @@ class Database:
         record = await self.settings.find_one({"_id": "filename_username"})
         return str(record.get("value", "")) if record else ""
 
-    async def create_job(self, source_id: int, message_id: int, output_id: int) -> bool:
+    async def create_job(self, source_id: int, message_id: int, output_id: int, media_metadata: dict | None = None) -> bool:
         now = datetime.now(timezone.utc)
+        record = {
+            "source_channel_id": int(source_id),
+            "source_message_id": int(message_id),
+            "output_channel_id": int(output_id),
+            "status": "pending",
+            "stage": "queued",
+            "workflow_version": 3,
+            "attempts": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if media_metadata:
+            record["media_metadata"] = dict(media_metadata)
         try:
-            await self.jobs.insert_one({
-                "source_channel_id": int(source_id),
-                "source_message_id": int(message_id),
-                "output_channel_id": int(output_id),
-                "status": "pending",
-                "stage": "queued",
-                "workflow_version": 2,
-                "attempts": 0,
-                "created_at": now,
-                "updated_at": now,
-            })
+            await self.jobs.insert_one(record)
             return True
         except DuplicateKeyError:
             return False
@@ -125,7 +129,7 @@ class Database:
             {
                 "source_channel_id": int(source_id),
                 "source_message_id": int(message_id),
-                "status": "processing",
+                "status": {"$in": ["submitting", "processing"]},
                 "stage": expected_stage,
             },
             {"$set": fields},
@@ -142,9 +146,9 @@ class Database:
             },
             {
                 "$set": {
-                    "status": "processing",
+                    "status": "submitting",
                     "stage": "preflight",
-                    "workflow_version": 2,
+                    "workflow_version": 3,
                     "updated_at": datetime.now(timezone.utc),
                 },
                 "$inc": {"attempts": 1},
@@ -153,42 +157,83 @@ class Database:
         return result.modified_count == 1
 
     async def get_pending_jobs(self):
-        return self.jobs.find({"status": "pending"}).sort("created_at", 1)
+        return self.jobs.find({"status": "pending"}).sort([("created_at", 1), ("_id", 1)])
+
+    async def get_output_jobs(self):
+        """Jobs that were submitted (or whose callback result was uncertain) but lack output."""
+        return self.jobs.find({"status": {"$in": ["submitted", "submission_unknown"]}}).sort(
+            [("submitted_at", 1), ("created_at", 1), ("_id", 1)]
+        )
+
+    async def begin_output_publish(self, source_id: int, message_id: int, output_message_id: int) -> bool:
+        """Atomically fence the one output upload attempt for a submitted job."""
+        result = await self.jobs.update_one(
+            {
+                "source_channel_id": int(source_id),
+                "source_message_id": int(message_id),
+                "status": {"$in": ["submitted", "submission_unknown"]},
+            },
+            {
+                "$set": {
+                    "status": "publishing",
+                    "stage": "publishing",
+                    "output_candidate_message_id": int(output_message_id),
+                    "publishing_started_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        return result.modified_count == 1
+
+    async def add_output_reply_id(self, source_id: int, message_id: int, reply_id: int):
+        await self.jobs.update_one(
+            {"source_channel_id": int(source_id), "source_message_id": int(message_id)},
+            {"$addToSet": {"output_reply_ids": int(reply_id)}, "$set": {"updated_at": datetime.now(timezone.utc)}},
+        )
 
     async def job_counts(self) -> dict[str, int]:
         counts = {}
-        for status in ("pending", "processing", "publishing", "completed", "failed"):
+        for status in ("pending", "processing", "submitting", "submitted", "submission_unknown", "publishing", "completed", "failed"):
             counts[status] = await self.jobs.count_documents({"status": status})
         return counts
 
     async def recover_interrupted_jobs(self, max_attempts: int = 3):
-        """Retry only jobs known not to have started an external rename conversation."""
+        """Recover queued/submitted jobs without re-sending non-idempotent rename actions."""
         await self.jobs.update_many(
-            {"status": "processing", "workflow_version": 2, "stage": "preflight"},
+            {"status": "submitting", "workflow_version": 3, "stage": "preflight"},
             {"$set": {"status": "pending", "error": "Recovered before rename-bot interaction; safe to retry.", "updated_at": datetime.now(timezone.utc)}},
         )
         await self.jobs.update_many(
-            {"status": "processing", "workflow_version": 2, "stage": {"$ne": "preflight"}},
-            {"$set": {"status": "failed", "error": "Interrupted after rename-bot interaction began; not restarted to prevent duplicate rename/callback actions.", "updated_at": datetime.now(timezone.utc)}},
+            {"status": "submitting", "workflow_version": 3, "stage": {"$in": ["callback_submitting", "callback_unknown"]}},
+            {"$set": {"status": "submission_unknown", "stage": "callback_unknown", "error": "Restarted while callback acknowledgement was uncertain; output tracking restored without resubmission.", "updated_at": datetime.now(timezone.utc)}},
         )
         await self.jobs.update_many(
-            {"status": "publishing"},
-            {"$set": {"status": "failed", "stage": "publishing", "error": "Interrupted during output publish; inspect output channel before manual retry.", "updated_at": datetime.now(timezone.utc)}},
+            {"status": "submitting", "workflow_version": 3, "stage": {"$nin": ["preflight", "callback_submitting", "callback_unknown"]}},
+            {"$set": {"status": "failed", "error": "Interrupted during submission; not restarted to prevent duplicate rename/callback actions.", "updated_at": datetime.now(timezone.utc)}},
         )
-        # Old job records do not have stage checkpoints. An attempt already made by
-        # an older runtime may have reached the rename bot, so fence it rather than
-        # restarting that non-idempotent conversation after an upgrade/restart.
         await self.jobs.update_many(
             {
-                "workflow_version": {"$ne": 2},
-                "status": {"$in": ["pending", "processing", "failed"]},
+                "status": "publishing",
+            },
+            {"$set": {"status": "failed", "stage": "publishing", "error": "Interrupted during output publish; inspect output channel before manual retry.", "updated_at": datetime.now(timezone.utc)}},
+        )
+        # Older records have no separate submission/output checkpoints. An attempted
+        # legacy workflow is fenced instead of blindly restarting its callback.
+        await self.jobs.update_many(
+            {
+                "workflow_version": {"$ne": 3},
+                "status": {"$in": ["pending", "processing", "submitting", "failed"]},
                 "attempts": {"$gt": 0},
                 "stage": {"$nin": ["publishing", "cancelled"]},
             },
             {"$set": {"status": "failed", "stage": "legacy_ambiguous", "error": "Legacy job state is ambiguous; not retried to avoid repeating a rename-bot workflow.", "updated_at": datetime.now(timezone.utc)}},
         )
         await self.jobs.update_many(
-            {"status": "failed", "workflow_version": 2, "stage": "preflight", "attempts": {"$lt": int(max_attempts)}},
+            {"status": "submitting", "workflow_version": {"$ne": 3}},
+            {"$set": {"status": "failed", "error": "Legacy submission interrupted; not restarted to prevent duplicates.", "updated_at": datetime.now(timezone.utc)}},
+        )
+        await self.jobs.update_many(
+            {"status": "failed", "workflow_version": 3, "stage": "preflight", "attempts": {"$lt": int(max_attempts)}},
             {"$set": {"status": "pending", "error": "Scheduled for bounded retry after restart.", "updated_at": datetime.now(timezone.utc)}},
         )
 
