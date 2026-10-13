@@ -13,7 +13,13 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from plugins.commands import _normalize_thumbnail
 from config import DB_NAME
 from plugins.database import Database
-from plugins.filename_utils import append_username, extract_original_filename, extract_video_metadata
+from plugins.filename_utils import (
+    append_username,
+    extract_original_filename,
+    extract_video_metadata,
+    format_standardized_filename,
+    normalize_filename_key,
+)
 from plugins.rename_runtime import RenameRuntime, select_second_inline_button
 
 
@@ -46,6 +52,8 @@ class FilenameTests(unittest.TestCase):
             "Show Season 1 Episode 3 1440p.mkv": (1, 3, 1440),
             "Show Ep_1_1080p.mp4": (None, 1, 1080),
             "Show Ep1_1080p.mp4": (None, 1, 1080),
+            "Show_Episode_12_in_Hindi_480p.mp4": (None, 12, 480),
+            "Show_S1_Episode_12_1080p.mkv": (1, 12, 1080),
             "Show E1-720.mkv": (None, 1, 720),
             "Show S01E04 4K.mkv": (1, 4, 2160),
             "Show S02E01 2160p.mkv": (2, 1, 2160),
@@ -66,6 +74,20 @@ class FilenameTests(unittest.TestCase):
         self.assertNotEqual(
             extract_video_metadata("Show.E480.1080p.mkv")["group_key"],
             extract_video_metadata("Show.E481.720p.mkv")["group_key"],
+        )
+
+    def test_standard_filename_uses_only_detected_metadata_and_original_extension(self):
+        original = "Ultraviolet_Code_044_Episode_12_in_Hindi_dubbed_@SBANIME_480p @username.mp4"
+        metadata = extract_video_metadata(original)
+        self.assertEqual((metadata["episode"], metadata["quality"]), (12, 480))
+        self.assertEqual(format_standardized_filename("@Sitaratoons", metadata, original), "[@Sitaratoons] Ep12 480p.mp4")
+        no_metadata = extract_video_metadata("Movie.2024.mkv")
+        self.assertEqual(format_standardized_filename("@Sitaratoons", no_metadata, "Movie.2024.mkv"), "Movie.2024 @Sitaratoons.mkv")
+
+    def test_separator_variants_have_equal_normalized_filename_keys(self):
+        self.assertEqual(
+            normalize_filename_key("Ultraviolet_Code_044_Episode_12_480p.mp4"),
+            normalize_filename_key("Ultraviolet.Code.044.Ep12.480p.MP4"),
         )
 
 
@@ -233,8 +255,20 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
         )
         runtime.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=source_message))
         runtime._rename_conversation = AsyncMock(side_effect=asyncio.TimeoutError("final media timed out"))
-        job = {"attempts": 1, "output_channel_id": -100202}
-        current = {"attempts": 1, "stage": "callback_unknown"}
+        job = {
+            "source_channel_id": -100101,
+            "source_message_id": 42,
+            "attempts": 1,
+            "output_channel_id": -100202,
+            "expected_filename": "episode.mp4",
+        }
+        current = {
+            "source_channel_id": -100101,
+            "source_message_id": 42,
+            "attempts": 1,
+            "stage": "callback_unknown",
+            "status": "submission_unknown",
+        }
 
         with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, current])), patch(
             "plugins.rename_runtime.db.claim_job", new=AsyncMock(return_value=True)
@@ -245,13 +279,20 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
 
         update_job.assert_awaited_once()
         fields = update_job.await_args.kwargs
-        self.assertEqual(fields["status"], "failed")
+        self.assertEqual(fields["status"], "submission_unknown")
+        self.assertEqual(fields["submission_status"], "submission_unknown")
         self.assertEqual(fields["stage"], "callback_unknown")
 
     async def test_acknowledged_submission_does_not_wait_for_output_media(self):
         runtime = RenameRuntime()
         source_message = SimpleNamespace(video=SimpleNamespace(file_name="episode.mp4"), document=None)
-        job = {"attempts": 1, "output_channel_id": -100202}
+        job = {
+            "source_channel_id": -100101,
+            "source_message_id": 43,
+            "attempts": 1,
+            "output_channel_id": -100202,
+            "expected_filename": "episode.mp4",
+        }
         output_context = {"future": asyncio.get_running_loop().create_future()}
         submission = {"context": output_context, "expected_filename": "episode.mp4", "submission_unknown": False}
         runtime.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=source_message))
@@ -347,10 +388,12 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_source_messages_from_connected_channels_enqueue_once_by_compound_key(self):
         runtime = RenameRuntime()
         configs = {
-            100: {"output_channel_id": 900, "thumbnail": b"thumb-a"},
-            200: {"output_channel_id": 901, "thumbnail": b"thumb-b"},
+            100: {"channel_number": 1, "output_channel_id": 900, "thumbnail": b"thumb-a"},
+            200: {"channel_number": 2, "output_channel_id": 901, "thumbnail": b"thumb-b"},
         }
         with patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(side_effect=configs.get)), patch(
+            "plugins.rename_runtime.db.get_username", new=AsyncMock(return_value="@tag")
+        ), patch(
             "plugins.rename_runtime.db.create_job", new=AsyncMock(side_effect=[True, True, False])
         ) as create_job, patch.object(runtime, "_enqueue_job") as enqueue:
             messages = [
@@ -366,6 +409,10 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enqueue.call_args_list[1].args[:2], (200, 2))
         self.assertEqual(create_job.await_args_list[0].kwargs["media_metadata"]["quality"], 480)
         self.assertEqual(create_job.await_args_list[1].kwargs["media_metadata"]["quality"], 1080)
+        self.assertEqual(create_job.await_args_list[0].kwargs["channel_number"], 1)
+        self.assertEqual(create_job.await_args_list[0].kwargs["expected_filename"], "[@tag] S1 Ep1 480p.mp4")
+        self.assertEqual(create_job.await_args_list[1].kwargs["channel_number"], 2)
+        self.assertEqual(create_job.await_args_list[1].kwargs["expected_filename"], "[@tag] S1 Ep2 1080p.mkv")
 
     async def test_next_channel_submits_before_previous_output_is_available(self):
         runtime = RenameRuntime()
@@ -417,27 +464,106 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
         first = runtime._register_output_waiter({
             "source_channel_id": 100,
             "source_message_id": 1,
+            "status": "submitted",
             "expected_filename": "episode-a.mp4",
             "output_reply_ids": [10],
         })
         second = runtime._register_output_waiter({
             "source_channel_id": 200,
             "source_message_id": 2,
+            "status": "submitted",
             "expected_filename": "episode-b.mp4",
             "output_reply_ids": [20],
         })
         media_b = SimpleNamespace(id=202, video=SimpleNamespace(file_name="episode-b.mp4"), document=None, reply_to_message_id=20)
         media_a = SimpleNamespace(id=101, video=SimpleNamespace(file_name="episode-a.mp4"), document=None, reply_to_message_id=10)
 
-        self.assertTrue(runtime._route_output_message(media_b))
-        self.assertTrue(runtime._route_output_message(media_a))
+        with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()):
+            self.assertTrue(runtime._route_output_message(media_b))
+            self.assertTrue(runtime._route_output_message(media_a))
+            await asyncio.gather(*list(runtime._background_db_tasks))
         self.assertIs(second["future"].result(), media_b)
         self.assertIs(first["future"].result(), media_a)
 
+    async def test_metadata_matching_accepts_separator_and_username_suffix_variants(self):
+        runtime = RenameRuntime()
+        original = "Ultraviolet_Code_044_Episode_12_in_Hindi_dubbed_@SBANIME_480p @username.mp4"
+        metadata = extract_video_metadata(original)
+        context = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 3,
+            "source_channel_number": 4,
+            "output_channel_id": 900,
+            "status": "submitted",
+            "original_filename": original,
+            "expected_filename": "[@Sitaratoons] Ep12 480p.mp4",
+            "media_metadata": metadata,
+            "output_reply_ids": [100],
+        })
+        returned = SimpleNamespace(
+            id=101,
+            video=SimpleNamespace(file_name="Ultraviolet.Code.044.Episode_12.in_Hindi_dubbed.@SBANIME.480p.mp4"),
+            document=None,
+            caption=None,
+            reply_to_message_id=None,
+        )
+        with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()):
+            self.assertTrue(runtime._route_output_message(returned))
+            await asyncio.gather(*list(runtime._background_db_tasks))
+        self.assertIs(context["future"].result(), returned)
+
+    async def test_episode_and_quality_alone_do_not_match_different_series(self):
+        runtime = RenameRuntime()
+        context = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 4,
+            "status": "submitted",
+            "expected_filename": "[@tag] Ep12 480p.mp4",
+            "media_metadata": extract_video_metadata("Ultraviolet_Code_Episode_12_480p.mp4"),
+            "output_reply_ids": [100],
+        })
+        unrelated = SimpleNamespace(
+            id=101,
+            video=SimpleNamespace(file_name="Another_Show_Episode_12_480p.mp4"),
+            document=None,
+            caption=None,
+            reply_to_message_id=None,
+        )
+        self.assertFalse(runtime._route_output_message(unrelated))
+        self.assertFalse(context["future"].done())
+
+    async def test_unmatched_output_is_reconciled_when_matching_job_arrives(self):
+        runtime = RenameRuntime()
+        filename = "Ultraviolet.Code.044.Episode_12.in_Hindi_dubbed.@SBANIME.480p.mp4"
+        unmatched = SimpleNamespace(
+            id=202,
+            video=SimpleNamespace(file_name=filename),
+            document=None,
+            caption=None,
+            reply_to_message_id=None,
+        )
+        runtime._remember_unmatched_output(unmatched)
+        metadata = extract_video_metadata("Ultraviolet_Code_044_Episode_12_in_Hindi_dubbed_@SBANIME_480p @username.mp4")
+        with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()):
+            context = runtime._register_output_waiter({
+                "source_channel_id": 100,
+                "source_message_id": 5,
+                "source_channel_number": 1,
+                "output_channel_id": 900,
+                "status": "submitted",
+                "original_filename": "Ultraviolet_Code_044_Episode_12_in_Hindi_dubbed_@SBANIME_480p @username.mp4",
+                "expected_filename": "[@tag] Ep12 480p.mp4",
+                "media_metadata": metadata,
+                "output_reply_ids": [200],
+            })
+            await asyncio.gather(*list(runtime._background_db_tasks))
+        self.assertIs(context["future"].result(), unmatched)
+        self.assertEqual(len(runtime._unmatched_outputs), 0)
+
     async def test_identical_unanchored_filenames_are_not_guessed(self):
         runtime = RenameRuntime()
-        first = runtime._register_output_waiter({"source_channel_id": 100, "source_message_id": 1, "expected_filename": "same.mp4", "output_reply_ids": [10]})
-        second = runtime._register_output_waiter({"source_channel_id": 200, "source_message_id": 2, "expected_filename": "same.mp4", "output_reply_ids": [20]})
+        first = runtime._register_output_waiter({"source_channel_id": 100, "source_message_id": 1, "status": "submitted", "expected_filename": "same.mp4", "output_reply_ids": [10]})
+        second = runtime._register_output_waiter({"source_channel_id": 200, "source_message_id": 2, "status": "submitted", "expected_filename": "same.mp4", "output_reply_ids": [20]})
         media = SimpleNamespace(id=30, video=SimpleNamespace(file_name="same.mp4"), document=None, reply_to_message_id=None)
         self.assertFalse(runtime._route_output_message(media))
         self.assertFalse(first["future"].done())
@@ -559,7 +685,7 @@ class VideoPublicationTests(unittest.IsolatedAsyncioTestCase):
 class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
     async def test_job_is_completed_only_after_output_upload_succeeds(self):
         runtime = RenameRuntime()
-        job = {"source_channel_id": 100, "source_message_id": 7, "output_channel_id": 900, "expected_filename": "episode.mp4"}
+        job = {"source_channel_id": 100, "source_message_id": 7, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4", "original_caption": "source caption"}
         context = runtime._register_output_waiter(job)
         final = SimpleNamespace(id=501)
         context["future"].set_result(final)
@@ -570,7 +696,7 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
             events.append(("begin", source_id, message_id, output_message_id))
             return True
 
-        async def publish(*_args):
+        async def publish(*_args, **_kwargs):
             events.append(("upload",))
             return uploaded
 
@@ -585,11 +711,14 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event[0] for event in events], ["begin", "upload", "update"])
         self.assertEqual(events[-1], ("update", "completed"))
         self.assertEqual(update_job.await_args.kwargs["output_message_id"], 901)
-        publish_result.assert_awaited_once_with(final, 900, b"thumb", "episode.mp4")
+        self.assertEqual(update_job.await_args.kwargs["destination_message_id"], 901)
+        self.assertEqual(update_job.await_args.kwargs["rename_bot_output_message_id"], 501)
+        self.assertEqual(update_job.await_args.kwargs["publication_status"], "published")
+        publish_result.assert_awaited_once_with(final, 900, b"thumb", "episode.mp4", caption="source caption")
 
     async def test_upload_failure_is_logged_and_job_stays_uncompleted(self):
         runtime = RenameRuntime()
-        job = {"source_channel_id": 100, "source_message_id": 8, "output_channel_id": 900, "expected_filename": "episode.mp4"}
+        job = {"source_channel_id": 100, "source_message_id": 8, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4"}
         context = runtime._register_output_waiter(job)
         context["future"].set_result(SimpleNamespace(id=502))
         with patch("plugins.rename_runtime.db.begin_output_publish", new=AsyncMock(return_value=True)), patch(
@@ -597,6 +726,7 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
         ) as update_job, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=RuntimeError("output permission denied"))):
             await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
         self.assertEqual(update_job.await_args.kwargs["status"], "failed")
+        self.assertEqual(update_job.await_args.kwargs["publication_status"], "failed")
         self.assertEqual(update_job.await_args.kwargs["stage"], "publishing")
         self.assertIn("output permission denied", update_job.await_args.kwargs["error"])
 
@@ -606,6 +736,7 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
             "source_channel_id": 100,
             "source_message_id": 9,
             "output_channel_id": 900,
+            "status": "submitted",
             "expected_filename": "late.mp4",
             "output_reply_ids": [10],
         }
@@ -630,6 +761,7 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
             "source_channel_id": 100,
             "source_message_id": 10,
             "output_channel_id": 900,
+            "status": "submitted",
             "expected_filename": "bad.mp4",
             "output_reply_ids": [20],
         }
@@ -674,13 +806,74 @@ class SessionPreservationTests(unittest.IsolatedAsyncioTestCase):
 class DatabaseMappingTests(unittest.IsolatedAsyncioTestCase):
     async def test_source_mapping_and_its_own_thumbnail_are_saved_by_source_id(self):
         database = Database.__new__(Database)
-        database.configs = SimpleNamespace(update_one=AsyncMock())
-        await database.set_channel_config(-100101, -100202, b"source-a-thumbnail")
+        database.configs = SimpleNamespace(
+            find_one=AsyncMock(side_effect=[None, {"channel_number": 7}]),
+            update_one=AsyncMock(),
+        )
+        database.settings = SimpleNamespace(find_one_and_update=AsyncMock(return_value={"value": 7}))
+        channel_number = await database.set_channel_config(-100101, -100202, b"source-a-thumbnail")
         call = database.configs.update_one.await_args
+        self.assertEqual(channel_number, 7)
         self.assertEqual(call.args[0], {"source_channel_id": -100101})
         self.assertEqual(call.kwargs["upsert"], True)
         self.assertEqual(call.args[1]["$set"]["output_channel_id"], -100202)
         self.assertEqual(call.args[1]["$set"]["thumbnail"], b"source-a-thumbnail")
+        self.assertEqual(call.args[1]["$setOnInsert"]["channel_number"], 7)
+
+    async def test_reconfiguring_a_source_preserves_its_channel_number(self):
+        database = Database.__new__(Database)
+        database.configs = SimpleNamespace(
+            find_one=AsyncMock(return_value={"channel_number": 7}),
+            update_one=AsyncMock(),
+        )
+        database.settings = SimpleNamespace(find_one_and_update=AsyncMock())
+        self.assertEqual(await database.set_channel_config(-100101, -100303), 7)
+        database.settings.find_one_and_update.assert_not_awaited()
+
+    async def test_legacy_channel_migration_allocates_stable_numbers(self):
+        class Cursor:
+            def __init__(self, items):
+                self.items = list(items)
+
+            def sort(self, *_args):
+                return self
+
+            def limit(self, *_args):
+                return self
+
+            async def to_list(self, length=None):
+                return self.items[:length] if length else self.items
+
+            def __aiter__(self):
+                self.items = iter(self.items)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        configs = SimpleNamespace(
+            find=Mock(side_effect=[Cursor([]), Cursor([
+                {"source_channel_id": -1001},
+                {"source_channel_id": -1002},
+            ])]),
+            find_one=AsyncMock(side_effect=[{"source_channel_id": -1001}, {"source_channel_id": -1002}]),
+            update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
+        )
+        database = Database.__new__(Database)
+        database.configs = configs
+        database.settings = SimpleNamespace(
+            find_one_and_update=AsyncMock(side_effect=[{"value": 1}, {"value": 2}]),
+            update_one=AsyncMock(),
+        )
+
+        await database._migrate_channel_numbers()
+
+        self.assertEqual(configs.update_one.await_count, 2)
+        self.assertEqual(configs.update_one.await_args_list[0].args[1]["$set"]["channel_number"], 1)
+        self.assertEqual(configs.update_one.await_args_list[1].args[1]["$set"]["channel_number"], 2)
 
 
 class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -705,9 +898,11 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         database._client = SimpleNamespace(admin=SimpleNamespace(command=AsyncMock()))
         database.configs = SimpleNamespace(create_index=AsyncMock())
         database.jobs = SimpleNamespace(create_index=AsyncMock())
+        database._migrate_channel_numbers = AsyncMock()
 
         await database.init()
 
+        database.configs.create_index.assert_any_await("channel_number", unique=True)
         database.jobs.create_index.assert_any_await(
             [("source_channel_id", 1), ("source_message_id", 1)],
             unique=True,
@@ -749,6 +944,8 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query["source_channel_id"], 100)
         self.assertEqual(query["source_message_id"], 7)
         self.assertEqual(update["$set"]["status"], "publishing")
+        self.assertEqual(update["$set"]["submission_status"], "submitted")
+        self.assertEqual(update["$set"]["publication_status"], "publishing")
         self.assertEqual(update["$set"]["output_candidate_message_id"], 999)
 
     async def test_job_stage_transition_is_atomic_and_requires_expected_state(self):
@@ -772,11 +969,30 @@ class DatabaseDuplicateTests(unittest.IsolatedAsyncioTestCase):
         database = Database.__new__(Database)
         database.jobs = SimpleNamespace(insert_one=AsyncMock(return_value=None))
         metadata = {"season": 1, "episode": 2, "quality": 480, "group_key": "series s01e02"}
-        self.assertTrue(await database.create_job(-100111, 42, -100222, media_metadata=metadata))
+        self.assertTrue(await database.create_job(
+            -100111,
+            42,
+            -100222,
+            media_metadata=metadata,
+            channel_number=6,
+            original_filename="Series_S01E02_480p.mkv",
+            original_caption="Original caption",
+            expected_filename="[@tag] S1 Ep2 480p.mkv",
+        ))
         payload = database.jobs.insert_one.await_args.args[0]
+        self.assertEqual(payload["job_id"], "-100111:42")
+        self.assertEqual(payload["source_channel_number"], 6)
         self.assertEqual(payload["source_channel_id"], -100111)
         self.assertEqual(payload["source_message_id"], 42)
         self.assertEqual(payload["output_channel_id"], -100222)
+        self.assertEqual(payload["destination_channel_id"], -100222)
+        self.assertEqual(payload["original_filename"], "Series_S01E02_480p.mkv")
+        self.assertEqual(payload["original_caption"], "Original caption")
+        self.assertEqual(payload["expected_filename"], "[@tag] S1 Ep2 480p.mkv")
+        self.assertEqual(payload["submission_status"], "queued")
+        self.assertEqual(payload["publication_status"], "pending")
+        self.assertEqual(payload["expected_output_message_ids"], [])
+        self.assertIsNone(payload["destination_message_id"])
         self.assertEqual(payload["status"], "pending")
         self.assertEqual(payload["workflow_version"], 3)
         self.assertEqual(payload["media_metadata"], metadata)
