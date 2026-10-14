@@ -334,7 +334,10 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             {"source_channel_id": -100101, "source_message_id": 42},
             {"source_channel_id": -100101, "source_message_id": 43},
         ])
-        with patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=cursor)) as get_pending, patch(
+        latest = {"job_id": "-100101:43", "source_channel_id": -100101, "source_message_id": 43}
+        with patch("plugins.rename_runtime.db.supersede_older_requests", new=AsyncMock(return_value={"latest": latest, "is_latest": True})), patch(
+            "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([]))
+        ), patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=cursor)) as get_pending, patch(
             "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
         ), patch("plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([]))), patch.object(
             runtime, "_enqueue_job"
@@ -342,8 +345,7 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             await runtime.resume_pending_jobs()
 
         get_pending.assert_awaited_once_with()
-        self.assertEqual(enqueue_job.call_count, 2)
-        enqueue_job.assert_any_call(-100101, 42, None)
+        self.assertEqual(enqueue_job.call_count, 1)
         enqueue_job.assert_any_call(-100101, 43, None)
 
     async def test_resume_restores_submitted_output_watchers_not_submissions(self):
@@ -370,7 +372,10 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             "expected_filename": "restored.mp4",
         }
         context = {"future": asyncio.get_running_loop().create_future()}
-        with patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=AsyncCursor([]))), patch(
+        latest = {**submitted, "job_id": "100:5"}
+        with patch("plugins.rename_runtime.db.supersede_older_requests", new=AsyncMock(return_value={"latest": latest, "is_latest": True})), patch(
+            "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([]))
+        ), patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=AsyncCursor([]))), patch(
             "plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([submitted]))
         ), patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})), patch.object(
             runtime, "_enqueue_job"
@@ -382,6 +387,71 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
         enqueue.assert_not_called()
         register.assert_called_once_with(submitted)
         ensure_output.assert_called_once_with(submitted, {"thumbnail": b"thumb"}, context)
+
+    async def test_resume_restores_superseded_jobs_only_as_stale_output_anchors(self):
+        class AsyncCursor:
+            def __init__(self, items):
+                self.items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        runtime = RenameRuntime()
+        runtime.user_client = object()
+        latest = {
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "job_id": "100:6",
+            "status": "submitted",
+            "expected_filename": "latest.mp4",
+            "output_reply_ids": [60],
+        }
+        old = {
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "status": "superseded",
+            "expected_filename": "old.mp4",
+            "output_reply_ids": [10],
+        }
+        with patch("plugins.rename_runtime.db.supersede_older_requests", new=AsyncMock(return_value={"latest": latest, "is_latest": True})), patch(
+            "plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=AsyncCursor([]))
+        ), patch("plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([latest]))), patch(
+            "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([old]))
+        ), patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})), patch.object(
+            runtime, "_ensure_output_task"
+        ), patch.object(runtime, "_recover_recent_outputs", new=AsyncMock()):
+            await runtime.resume_pending_jobs()
+
+        self.assertEqual(runtime._active_request_job_id, "100:6")
+        self.assertIn((100, 6), runtime._output_waiters)
+        self.assertIn((100, 1), runtime._superseded_waiters)
+
+    async def test_superseded_output_task_cannot_claim_destination_upload(self):
+        runtime = RenameRuntime()
+        runtime._active_request_job_id = "100:6"
+        job = {
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "output_channel_id": 900,
+            "status": "submitted",
+            "expected_filename": "old.mp4",
+        }
+        context = runtime._register_output_waiter(job)
+        context["future"].set_result(SimpleNamespace(id=50))
+        with patch("plugins.rename_runtime.db.begin_output_publish", new=AsyncMock()) as begin, patch.object(
+            runtime, "_publish_result", new=AsyncMock()
+        ) as publish:
+            await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
+        begin.assert_not_awaited()
+        publish.assert_not_awaited()
 
 
 class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -395,7 +465,10 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
             "plugins.rename_runtime.db.get_username", new=AsyncMock(return_value="@tag")
         ), patch(
             "plugins.rename_runtime.db.create_job", new=AsyncMock(side_effect=[True, True, False])
-        ) as create_job, patch.object(runtime, "_enqueue_job") as enqueue:
+        ) as create_job, patch("plugins.rename_runtime.db.supersede_older_requests", new=AsyncMock(side_effect=[
+            {"latest": {"job_id": "100:1", "source_channel_id": 100, "source_message_id": 1}, "is_latest": True},
+            {"latest": {"job_id": "200:2", "source_channel_id": 200, "source_message_id": 2}, "is_latest": True},
+        ])), patch.object(runtime, "_enqueue_job") as enqueue:
             messages = [
                 SimpleNamespace(chat=SimpleNamespace(id=100, type=enums.ChatType.CHANNEL), id=1, video=SimpleNamespace(file_name="A S01E01 480p.mp4"), document=None),
                 SimpleNamespace(chat=SimpleNamespace(id=200, type=enums.ChatType.CHANNEL), id=2, video=None, document=SimpleNamespace(file_name="B S01E02 1080p.mkv")),
@@ -534,6 +607,7 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unmatched_output_is_reconciled_when_matching_job_arrives(self):
         runtime = RenameRuntime()
+        runtime._active_request_job_id = "100:5"
         filename = "Ultraviolet.Code.044.Episode_12.in_Hindi_dubbed.@SBANIME.480p.mp4"
         unmatched = SimpleNamespace(
             id=202,
@@ -568,6 +642,143 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runtime._route_output_message(media))
         self.assertFalse(first["future"].done())
         self.assertFalse(second["future"].done())
+
+    async def test_delayed_superseded_output_is_recorded_but_not_matched_to_latest(self):
+        runtime = RenameRuntime()
+        old = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "status": "superseded",
+            "expected_filename": "old-episode.mp4",
+            "output_reply_ids": [10],
+        })
+        runtime._output_waiters.pop((100, 1))
+        runtime._superseded_waiters[(100, 1)] = old
+        latest = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "job_id": "100:6",
+            "status": "submitted",
+            "expected_filename": "latest-episode.mp4",
+            "output_reply_ids": [20],
+        })
+        old_media = SimpleNamespace(
+            id=30,
+            video=SimpleNamespace(file_name="old-episode.mp4"),
+            document=None,
+            caption=None,
+            reply_to_message_id=10,
+        )
+        with patch("plugins.rename_runtime.db.add_superseded_output", new=AsyncMock()) as add_old_output:
+            self.assertTrue(runtime._route_output_message(old_media))
+            await asyncio.gather(*list(runtime._background_db_tasks))
+        add_old_output.assert_awaited_once_with(100, 1, 30)
+        self.assertFalse(latest["future"].done())
+
+    async def test_new_request_freezes_prior_unmatched_media_and_old_waiters(self):
+        runtime = RenameRuntime()
+        old_context = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "status": "submitted",
+            "expected_filename": "old.mp4",
+            "output_reply_ids": [10],
+        })
+        runtime._unmatched_outputs.append({
+            "message": SimpleNamespace(id=15),
+            "metadata": {},
+            "received_at": asyncio.get_running_loop().time(),
+            "request_job_id": "100:1",
+            "frozen": False,
+        })
+
+        runtime._activate_latest_request({
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "job_id": "100:6",
+        })
+
+        self.assertEqual(runtime._active_request_job_id, "100:6")
+        self.assertNotIn((100, 1), runtime._output_waiters)
+        self.assertIs(runtime._superseded_waiters[(100, 1)], old_context)
+        self.assertTrue(runtime._unmatched_outputs[0]["frozen"])
+
+    async def test_same_name_as_old_and_latest_request_is_held_without_anchor(self):
+        runtime = RenameRuntime()
+        old = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "status": "superseded",
+            "expected_filename": "same.mp4",
+            "output_reply_ids": [10],
+        })
+        runtime._output_waiters.pop((100, 1))
+        runtime._superseded_waiters[(100, 1)] = old
+        latest = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "job_id": "100:6",
+            "status": "submitted",
+            "expected_filename": "same.mp4",
+            "output_reply_ids": [20],
+        })
+        media = SimpleNamespace(id=30, video=SimpleNamespace(file_name="same.mp4"), document=None, caption=None, reply_to_message_id=None)
+        with patch("plugins.rename_runtime.db.add_superseded_output", new=AsyncMock()) as add_old_output:
+            self.assertTrue(runtime._route_output_message(media))
+            await asyncio.gather(*list(runtime._background_db_tasks))
+        add_old_output.assert_awaited_once_with(100, 1, 30)
+        self.assertFalse(latest["future"].done())
+
+    async def test_latest_reply_anchor_routes_output_despite_stale_metadata_similarity(self):
+        runtime = RenameRuntime()
+        metadata = extract_video_metadata("Show.S01E04.1080p.mp4")
+        old = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 1,
+            "job_id": "100:1",
+            "status": "superseded",
+            "expected_filename": "old-name.mp4",
+            "media_metadata": metadata,
+            "output_reply_ids": [10],
+        })
+        runtime._output_waiters.pop((100, 1))
+        runtime._superseded_waiters[(100, 1)] = old
+        latest = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "job_id": "100:6",
+            "status": "submitted",
+            "expected_filename": "latest-name.mp4",
+            "media_metadata": metadata,
+            "output_reply_ids": [20],
+        })
+        media = SimpleNamespace(
+            id=30,
+            video=SimpleNamespace(file_name="latest-name.mp4"),
+            document=None,
+            caption=None,
+            reply_to_message_id=20,
+        )
+        with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()):
+            self.assertTrue(runtime._route_output_message(media))
+            await asyncio.gather(*list(runtime._background_db_tasks))
+        self.assertIs(latest["future"].result(), media)
+
+    async def test_unanchored_media_is_not_assigned_to_the_only_waiter(self):
+        runtime = RenameRuntime()
+        context = runtime._register_output_waiter({
+            "source_channel_id": 100,
+            "source_message_id": 6,
+            "status": "submitted",
+            "expected_filename": "latest.mp4",
+            "output_reply_ids": [20],
+        })
+        media = SimpleNamespace(id=30, video=SimpleNamespace(file_name=None), document=None, caption=None, reply_to_message_id=None)
+        self.assertFalse(runtime._route_output_message(media))
+        self.assertFalse(context["future"].done())
 
 
 class VideoPublicationTests(unittest.IsolatedAsyncioTestCase):
@@ -934,6 +1145,53 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await database.get_output_jobs()
         database.jobs.find.assert_called_once_with({"status": {"$in": ["submitted", "submission_unknown"]}})
         cursor.sort.assert_called_once_with([("submitted_at", 1), ("created_at", 1), ("_id", 1)])
+
+    async def test_latest_request_supersedes_older_unresolved_jobs(self):
+        latest = {"_id": "new", "job_id": "100:6", "source_channel_id": 100, "source_message_id": 6}
+        database = Database.__new__(Database)
+        database.jobs = SimpleNamespace(
+            find_one=AsyncMock(side_effect=[latest, latest]),
+            update_many=AsyncMock(return_value=SimpleNamespace(modified_count=3)),
+        )
+        result = await database.supersede_older_requests(100, 6)
+        self.assertTrue(result["is_latest"])
+        self.assertEqual(result["latest"], latest)
+        self.assertEqual(result["superseded_count"], 3)
+        query, update = database.jobs.update_many.await_args.args
+        self.assertEqual(query["_id"], {"$ne": "new"})
+        self.assertEqual(query["status"]["$in"], ["pending", "processing", "submitting", "submitted", "submission_unknown"])
+        self.assertEqual(update["$set"]["status"], "superseded")
+        self.assertEqual(update["$set"]["superseded_by_job_id"], "100:6")
+
+    async def test_late_insert_is_itself_marked_superseded(self):
+        latest = {"_id": "new", "job_id": "100:6"}
+        older = {"_id": "old", "job_id": "100:4"}
+        database = Database.__new__(Database)
+        database.jobs = SimpleNamespace(
+            find_one=AsyncMock(side_effect=[latest, older]),
+            update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
+            update_many=AsyncMock(return_value=SimpleNamespace(modified_count=2)),
+        )
+        result = await database.supersede_older_requests(100, 4)
+        self.assertFalse(result["is_latest"])
+        self.assertEqual(result["superseded_count"], 3)
+        update = database.jobs.update_one.await_args.args[1]["$set"]
+        self.assertEqual(update["status"], "superseded")
+        self.assertEqual(update["superseded_by_job_id"], "100:6")
+        database.jobs.update_many.assert_awaited_once()
+
+    async def test_superseded_jobs_are_queryable_for_restart_correlation(self):
+        database = Database.__new__(Database)
+        cursor = SimpleNamespace(sort=Mock(return_value=None), limit=Mock(return_value=None))
+        # Motor cursors return themselves from sort/limit; use a fluent test double.
+        cursor.sort.return_value = cursor
+        cursor.limit.return_value = cursor
+        database.jobs = SimpleNamespace(find=Mock(return_value=cursor))
+        result = await database.get_superseded_jobs()
+        self.assertIs(result, cursor)
+        database.jobs.find.assert_called_once_with({"status": "superseded"})
+        cursor.sort.assert_called_once_with([("superseded_at", -1), ("created_at", -1), ("_id", -1)])
+        cursor.limit.assert_called_once_with(1000)
 
     async def test_output_publish_claim_is_atomic_for_submitted_states(self):
         database = Database.__new__(Database)
