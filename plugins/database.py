@@ -8,6 +8,8 @@ from pymongo.errors import DuplicateKeyError
 
 from config import DB_NAME, DB_URI
 
+_UNRESOLVED_REQUEST_STATES = ["pending", "processing", "submitting", "submitted", "submission_unknown"]
+
 
 class Database:
     def __init__(self, uri: str, database_name: str):
@@ -217,6 +219,71 @@ class Database:
     async def get_job(self, source_id: int, message_id: int) -> dict | None:
         return await self.jobs.find_one({"source_channel_id": int(source_id), "source_message_id": int(message_id)})
 
+    async def supersede_older_requests(self, source_id: int | None = None, message_id: int | None = None) -> dict:
+        """Keep only the newest request eligible for rename output publication."""
+        latest = await self.jobs.find_one({}, sort=[("created_at", -1), ("_id", -1)])
+        if not latest:
+            return {"latest": None, "is_latest": False, "superseded_count": 0}
+
+        if source_id is not None and message_id is not None:
+            current = await self.get_job(source_id, message_id)
+            if not current:
+                return {"latest": latest, "is_latest": False, "superseded_count": 0}
+            is_latest = current.get("_id") == latest.get("_id")
+            if not is_latest:
+                current_result = await self.jobs.update_one(
+                    {"source_channel_id": int(source_id), "source_message_id": int(message_id), "status": {"$in": _UNRESOLVED_REQUEST_STATES}},
+                    {"$set": self._superseded_fields(latest.get("job_id"))},
+                )
+                older_result = await self.jobs.update_many(
+                    {
+                        "_id": {"$ne": latest["_id"]},
+                        "status": {"$in": _UNRESOLVED_REQUEST_STATES},
+                    },
+                    {"$set": self._superseded_fields(latest.get("job_id"))},
+                )
+                return {
+                    "latest": latest,
+                    "is_latest": False,
+                    "superseded_count": older_result.modified_count + current_result.modified_count,
+                }
+
+        result = await self.jobs.update_many(
+            {
+                "_id": {"$ne": latest["_id"]},
+                "status": {"$in": _UNRESOLVED_REQUEST_STATES},
+            },
+            {"$set": self._superseded_fields(latest.get("job_id"))},
+        )
+        return {"latest": latest, "is_latest": True, "superseded_count": result.modified_count}
+
+    @staticmethod
+    def _superseded_fields(superseded_by: str | None) -> dict:
+        now = datetime.now(timezone.utc)
+        return {
+            "status": "superseded",
+            "submission_status": "superseded",
+            "publication_status": "superseded",
+            "stage": "superseded",
+            "superseded_by_job_id": superseded_by,
+            "superseded_at": now,
+            "updated_at": now,
+        }
+
+    async def get_superseded_jobs(self):
+        return self.jobs.find({"status": "superseded"}).sort(
+            [("superseded_at", -1), ("created_at", -1), ("_id", -1)]
+        ).limit(1000)
+
+    async def add_superseded_output(self, source_id: int, message_id: int, output_message_id: int):
+        await self.jobs.update_one(
+            {"source_channel_id": int(source_id), "source_message_id": int(message_id), "status": "superseded"},
+            {
+                "$addToSet": {"superseded_output_message_ids": int(output_message_id)},
+                "$set": {"last_superseded_output_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)},
+            },
+        )
+
     async def update_job(self, source_id: int, message_id: int, **fields):
         fields["updated_at"] = datetime.now(timezone.utc)
         await self.jobs.update_one(
@@ -299,7 +366,7 @@ class Database:
 
     async def job_counts(self) -> dict[str, int]:
         counts = {}
-        for status in ("pending", "processing", "submitting", "submitted", "submission_unknown", "publishing", "completed", "failed"):
+        for status in ("pending", "processing", "submitting", "submitted", "submission_unknown", "publishing", "completed", "failed", "superseded"):
             counts[status] = await self.jobs.count_documents({"status": status})
         return counts
 
