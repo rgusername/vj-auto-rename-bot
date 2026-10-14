@@ -41,6 +41,7 @@ _VIDEO_EXTENSIONS = frozenset({
 })
 _UNMATCHED_OUTPUT_MAX = 100
 _UNMATCHED_OUTPUT_TTL_SECONDS = 3600
+_SUPERSEDED_WAITER_MAX = 1000
 _CAPTION_UNSET = object()
 
 
@@ -84,8 +85,10 @@ class RenameRuntime:
         self._retry_job_keys: dict[asyncio.Task, tuple[int, int]] = {}
         self._background_db_tasks: set[asyncio.Task] = set()
         self._output_waiters: dict[tuple[int, int], dict] = {}
+        self._superseded_waiters: dict[tuple[int, int], dict] = {}
         self._output_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._unmatched_outputs: deque[dict] = deque()
+        self._active_request_job_id: str | None = None
         self._stopping_session = False
         self._handler_group = 70
 
@@ -219,25 +222,26 @@ class RenameRuntime:
             if future and not future.done():
                 future.cancel()
         self._output_waiters.clear()
+        self._superseded_waiters.clear()
         self._stopping_session = False
+        self._active_request_job_id = None
 
     async def _on_rename_bot_message(self, _client, message):
         body = message.text or message.caption or ""
         if not (message.video or message.document) and self._is_auto_delete_notice(message):
             reply_to = self._reply_to_message_id(message)
+            all_contexts = list(self._output_waiters.values()) + list(self._superseded_waiters.values())
             candidates = [
-                context for context in self._output_waiters.values()
+                context for context in all_contexts
                 if reply_to is not None and reply_to in context["reply_ids"]
             ]
             if not candidates:
                 text_matches = [
-                    context for context in self._output_waiters.values()
+                    context for context in all_contexts
                     if context.get("expected_filename") and context["expected_filename"].casefold() in body.casefold()
                 ]
                 if len(text_matches) == 1:
                     candidates = text_matches
-                elif not text_matches and len(self._output_waiters) == 1:
-                    candidates = list(self._output_waiters.values())
             for context in candidates:
                 context["reply_ids"].add(int(message.id))
                 task = asyncio.create_task(
@@ -321,11 +325,13 @@ class RenameRuntime:
             "error_event": asyncio.Event(),
             "submitted_order": job.get("submitted_at") or job.get("created_at") or datetime.now(timezone.utc),
             "job_id": job.get("job_id") or f"{source_id}:{message_id}",
+            "created_at": job.get("created_at"),
             "source_channel_number": job.get("source_channel_number"),
             "output_channel_id": int(job["output_channel_id"]) if job.get("output_channel_id") is not None else None,
             "original_filename": job.get("original_filename"),
             "original_caption": job.get("original_caption"),
             "media_metadata": dict(job.get("media_metadata") or {}),
+            "superseded_output_message_ids": set(job.get("superseded_output_message_ids") or []),
             "accepting_output": accepting_output if accepting_output is not None else job.get("status") in {"submitted", "submission_unknown"},
         }
         self._output_waiters[key] = context
@@ -357,29 +363,28 @@ class RenameRuntime:
         reply_to = self._reply_to_message_id(message)
         filename = self._media_filename(message)
         output_metadata = extract_video_metadata(filename, getattr(message, "caption", None))
-        eligible_waiters = sum(
-            1 for context in self._output_waiters.values()
-            if context.get("accepting_output") and not context["future"].done()
-        )
+        stale_matches = []
+        for key, context in self._superseded_waiters.items():
+            score = self._output_match_strength(context, message, filename, output_metadata)
+            if score is not None:
+                stale_matches.append((score, key, context))
+
         candidates = []
         for key, context in self._output_waiters.items():
-            future = context["future"]
-            if future.done() or (not allow_inactive and not context.get("accepting_output")):
+            if context["future"].done() or (not allow_inactive and not context.get("accepting_output")):
                 continue
-            anchor_floor = max(context["reply_ids"], default=0)
-            if int(getattr(message, "id", 0)) <= anchor_floor:
-                continue
-            reply_match = reply_to is not None and reply_to in context["reply_ids"]
-            expected = context.get("expected_filename")
-            exact_expected = bool(filename and expected and normalize_filename_key(filename) == normalize_filename_key(expected))
-            exact_original = bool(
-                filename and context.get("original_filename")
-                and normalize_filename_key(filename) == normalize_filename_key(context["original_filename"])
-            )
-            metadata_score = self._metadata_match_score(context.get("media_metadata"), output_metadata)
-            if reply_match or exact_expected or exact_original or metadata_score is not None or (not filename and reply_to is None and eligible_waiters == 1):
-                score = 100 if reply_match else 90 if exact_expected else 85 if exact_original else metadata_score or 10
+            score = self._output_match_strength(context, message, filename, output_metadata)
+            if score is not None:
                 candidates.append((score, context["submitted_order"], key, context))
+
+        # An old reply anchor always wins over a coincidentally similar new
+        # filename. A direct reply to the current request is equally definitive.
+        if stale_matches and max(item[0] for item in stale_matches) >= 100:
+            self._hold_superseded_output(message, stale_matches)
+            return True
+        if stale_matches and not any(item[0] >= 100 for item in candidates):
+            self._hold_superseded_output(message, stale_matches)
+            return True
         if not candidates:
             return False
         candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -418,6 +423,45 @@ class RenameRuntime:
         )
         return True
 
+    def _output_match_strength(self, context: dict, message, filename: str | None, output_metadata: dict) -> int | None:
+        reply_to = self._reply_to_message_id(message)
+        anchor_floor = max(context.get("reply_ids", set()), default=0)
+        if int(getattr(message, "id", 0)) <= anchor_floor:
+            return None
+        if reply_to is not None and reply_to in context.get("reply_ids", set()):
+            return 100
+        expected = context.get("expected_filename")
+        if filename and expected and normalize_filename_key(filename) == normalize_filename_key(expected):
+            return 90
+        original = context.get("original_filename")
+        if filename and original and normalize_filename_key(filename) == normalize_filename_key(original):
+            return 85
+        return self._metadata_match_score(context.get("media_metadata"), output_metadata)
+
+    def _hold_superseded_output(self, message, stale_matches):
+        message_id = int(getattr(message, "id", 0))
+        strongest = max(item[0] for item in stale_matches)
+        matches = [item for item in stale_matches if item[0] == strongest]
+        if len(matches) != 1:
+            self._remember_unmatched_output(message, frozen=True)
+            logger.warning(
+                "Leaving rename-bot output message=%s pending: it matches multiple superseded jobs and cannot be safely attributed.",
+                message_id,
+            )
+            return
+        _, key, context = matches[0]
+        if message_id not in context["superseded_output_message_ids"]:
+            context["superseded_output_message_ids"].add(message_id)
+            self._schedule_db_task(
+                db.add_superseded_output(key[0], key[1], message_id),
+                f"superseded-output:{key[0]}:{key[1]}:{message_id}",
+            )
+        logger.info(
+            "Leaving late output message=%s pending for superseded job=%s; it will not be published to the latest request.",
+            message_id,
+            context.get("job_id"),
+        )
+
     async def _persist_matched_output(self, context: dict, message, metadata: dict):
         try:
             await db.update_job(
@@ -452,7 +496,7 @@ class RenameRuntime:
         if expired:
             logger.info("Expired %s unmatched rename-bot output item(s) beyond the retention window.", expired)
 
-    def _remember_unmatched_output(self, message):
+    def _remember_unmatched_output(self, message, *, frozen: bool = False):
         loop = asyncio.get_running_loop()
         now = loop.time()
         message_date = getattr(message, "date", None)
@@ -489,6 +533,8 @@ class RenameRuntime:
             "message": message,
             "metadata": metadata,
             "received_at": received_at,
+            "request_job_id": self._active_request_job_id,
+            "frozen": bool(frozen or self._active_request_job_id is None),
         })
         logger.warning(
             "Stored unmatched rename-bot media message=%s filename=%s metadata=%s possible_jobs=%s; retained for reconciliation.",
@@ -505,11 +551,53 @@ class RenameRuntime:
         pending = list(self._unmatched_outputs)
         self._unmatched_outputs.clear()
         for item in pending:
-            if not self._route_output_message(item["message"]):
+            if item.get("frozen") or item.get("request_job_id") != self._active_request_job_id:
+                item["frozen"] = True
                 self._unmatched_outputs.append(item)
+            elif not self._route_output_message(item["message"]):
+                self._unmatched_outputs.append(item)
+
+    def _activate_latest_request(self, job: dict):
+        """Fence old pending workflows locally and retain their anchors for stale detection."""
+        latest_job_id = job.get("job_id") or f"{job['source_channel_id']}:{job['source_message_id']}"
+        self._active_request_job_id = latest_job_id
+        for item in self._unmatched_outputs:
+            item["frozen"] = True
+
+        for key, context in list(self._output_waiters.items()):
+            if context.get("job_id") == latest_job_id or context.get("publishing"):
+                continue
+            self._output_waiters.pop(key, None)
+            context["accepting_output"] = False
+            context["superseded"] = True
+            self._superseded_waiters[key] = context
+            task = self._output_tasks.get(key)
+            if task and not task.done() and not context["future"].done():
+                task.cancel()
+
+        # Older queued/submitting requests have already been persisted as
+        # superseded; cancel their in-flight Python work so it cannot continue
+        # issuing rename-bot actions. _process_job preserves that terminal state.
+        for task in list(self._jobs.values()):
+            if not task.done():
+                task.cancel()
+        for task in list(self._retry_tasks):
+            if not task.done():
+                task.cancel()
+        self._submission_items.clear()
+        self._queued_keys.clear()
+
+        while len(self._superseded_waiters) > _SUPERSEDED_WAITER_MAX:
+            old_key = next(iter(self._superseded_waiters))
+            removed = self._superseded_waiters.pop(old_key)
+            logger.warning("Dropping in-memory stale-output anchors for superseded job=%s after reaching the retention limit.", removed.get("job_id"))
 
     def _ensure_output_task(self, job: dict, config: dict, context: dict):
         key = (int(job["source_channel_id"]), int(job["source_message_id"]))
+        job_id = job.get("job_id") or f"{key[0]}:{key[1]}"
+        if self._active_request_job_id is not None and job_id != self._active_request_job_id:
+            logger.info("Not starting output tracking for superseded request job=%s; latest=%s", job_id, self._active_request_job_id)
+            return None
         current = self._output_tasks.get(key)
         if current and not current.done():
             return current
@@ -553,10 +641,18 @@ class RenameRuntime:
         source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
         key = (source_id, message_id)
         try:
+            job_id = job.get("job_id") or f"{source_id}:{message_id}"
+            if context.get("superseded") or (self._active_request_job_id is not None and job_id != self._active_request_job_id):
+                logger.info("Not publishing output for superseded request job=%s; latest=%s", job_id, self._active_request_job_id)
+                return
             final_message = await self._wait_for_output_message(context, source_id, message_id)
+            if context.get("superseded") or (self._active_request_job_id is not None and job_id != self._active_request_job_id):
+                logger.info("Keeping late output pending for superseded request job=%s", job_id)
+                return
             if not await db.begin_output_publish(source_id, message_id, int(final_message.id)):
                 logger.info("Output publication already claimed or job no longer eligible source=%s message=%s", source_id, message_id)
                 return
+            context["publishing"] = True
             output_id = int(job["output_channel_id"])
             expected_filename = context.get("expected_filename") or job.get("expected_filename") or job.get("final_filename") or self._media_filename(final_message)
             try:
@@ -667,11 +763,26 @@ class RenameRuntime:
                     original_caption=original_caption,
                     expected_filename=expected_filename,
                 )
+                latest_result = (
+                    await db.supersede_older_requests(source_id, message_id)
+                    if created else None
+                )
+                if created and latest_result and latest_result.get("is_latest"):
+                    self._activate_latest_request(latest_result["latest"])
+                    if config.get("thumbnail"):
+                        self._enqueue_job(source_id, message_id, media_metadata)
         except Exception:
             logger.exception("Could not load source configuration or record source=%s message=%s", message.chat.id, message.id)
             return
         if not created:
             logger.info("Ignoring duplicate source job source=%s message=%s", source_id, message_id)
+            return
+        if not latest_result or not latest_result.get("is_latest"):
+            logger.info(
+                "Source job=%s was superseded during acceptance by newer job=%s; it will not be submitted.",
+                f"{source_id}:{message_id}",
+                (latest_result or {}).get("latest", {}).get("job_id"),
+            )
             return
         logger.info(
             "Accepted rename job=%s Channel %s source=%s message=%s destination=%s status=queued metadata=%s expected_filename=%s",
@@ -683,8 +794,6 @@ class RenameRuntime:
             media_metadata,
             expected_filename,
         )
-        if config.get("thumbnail"):
-            self._enqueue_job(source_id, message_id, media_metadata)
 
     def _ensure_submission_worker(self):
         if not self.user_client or not self.rename_bot_id:
@@ -789,8 +898,17 @@ class RenameRuntime:
     async def resume_pending_jobs(self):
         if not self.user_client:
             return
+        latest_result = await db.supersede_older_requests()
+        latest_job = latest_result.get("latest")
+        self._active_request_job_id = (
+            latest_job.get("job_id") or f"{latest_job['source_channel_id']}:{latest_job['source_message_id']}"
+            if latest_job else None
+        )
         pending_jobs = await db.get_pending_jobs()
         async for job in pending_jobs:
+            job_id = job.get("job_id") or f"{job['source_channel_id']}:{job['source_message_id']}"
+            if job_id != self._active_request_job_id:
+                continue
             source_id = int(job["source_channel_id"])
             config = await db.get_channel_config(source_id)
             if not config or not config.get("thumbnail"):
@@ -799,6 +917,9 @@ class RenameRuntime:
 
         output_jobs = await db.get_output_jobs()
         async for job in output_jobs:
+            job_id = job.get("job_id") or f"{job['source_channel_id']}:{job['source_message_id']}"
+            if job_id != self._active_request_job_id:
+                continue
             source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
             config = await db.get_channel_config(source_id)
             if not config or not config.get("thumbnail"):
@@ -806,6 +927,16 @@ class RenameRuntime:
                 continue
             context = self._register_output_waiter(job)
             self._ensure_output_task(job, config, context)
+        superseded_jobs = await db.get_superseded_jobs()
+        async for job in superseded_jobs:
+            key = (int(job["source_channel_id"]), int(job["source_message_id"]))
+            context = self._register_output_waiter(job, accepting_output=False)
+            self._output_waiters.pop(key, None)
+            context["accepting_output"] = False
+            context["superseded"] = True
+            self._superseded_waiters[key] = context
+        while len(self._superseded_waiters) > _SUPERSEDED_WAITER_MAX:
+            self._superseded_waiters.pop(next(iter(self._superseded_waiters)))
         await self._recover_recent_outputs()
 
     async def cancel_active(self) -> bool:
@@ -1199,6 +1330,9 @@ class RenameRuntime:
             job = await db.get_job(source_id, message_id)
             if not job:
                 return
+            if job.get("status") == "superseded":
+                logger.info("Skipping superseded submission job=%s", job.get("job_id") or f"{source_id}:{message_id}")
+                return
             if int(job.get("attempts", 0)) >= MAX_RENAME_ATTEMPTS:
                 await db.update_job(source_id, message_id, status="failed", submission_status="failed", error="Maximum processing attempts reached.")
                 return
@@ -1225,6 +1359,10 @@ class RenameRuntime:
             if not source_message or not (source_message.video or source_message.document):
                 raise RuntimeError("Source message is no longer available or is not a video/document.")
             submission = await self._rename_conversation(source_message, config, job, output_context)
+            current = await db.get_job(source_id, message_id)
+            if not current or current.get("status") == "superseded":
+                logger.info("Rename request became superseded before output tracking started job=%s", job.get("job_id"))
+                return
             job["expected_filename"] = submission["expected_filename"]
             self._ensure_output_task(job, config, submission["context"])
             logger.info(
@@ -1236,6 +1374,9 @@ class RenameRuntime:
             )
         except asyncio.CancelledError:
             current = await db.get_job(source_id, message_id)
+            if current and current.get("status") == "superseded":
+                logger.info("Stopped superseded rename workflow job=%s without changing its persistent state.", current.get("job_id"))
+                raise
             stage = current.get("stage") if current else None
             if stage == "preflight" and self._stopping_session:
                 await db.update_job(source_id, message_id, status="pending", submission_status="queued", stage="preflight", error="Session stopped before any rename-bot action; safe to resume.")
@@ -1258,6 +1399,9 @@ class RenameRuntime:
             logger.exception("Rename job failed for source=%s message=%s", source_id, message_id)
             error = str(exc)[:1000]
             current = await db.get_job(source_id, message_id)
+            if current and current.get("status") == "superseded":
+                logger.info("Ignored error from superseded rename workflow job=%s: %s", current.get("job_id"), error)
+                return
             attempt_count = int(current.get("attempts", 0)) if current else MAX_RENAME_ATTEMPTS
             stage = current.get("stage") if current else "publishing"
             if stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
