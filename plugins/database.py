@@ -1,6 +1,6 @@
 """Mongo persistence for user sessions and rename jobs."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import motor.motor_asyncio
 from pymongo import ReturnDocument
@@ -303,6 +303,61 @@ class Database:
 
     async def get_pending_jobs(self):
         return self.jobs.find({"status": "pending"}).sort([("created_at", 1), ("_id", 1)])
+
+    async def get_queue_jobs(self):
+        """Return nonterminal jobs in durable FIFO order for the single global worker."""
+        return self.jobs.find(
+            {
+                "status": {"$in": ["pending", "submitted", "submission_unknown", "failed"]},
+                "stage": {"$ne": "cancelled"},
+            }
+        ).sort([("created_at", 1), ("_id", 1)])
+
+    async def acquire_queue_lease(self, owner: str, lease_seconds: int = 60) -> bool:
+        """Atomically acquire or refresh the singleton cross-instance queue lease."""
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(seconds=int(lease_seconds))
+        query = {
+            "_id": "global_rename_queue_lease",
+            "$or": [{"lease_until": {"$lte": now}}, {"owner": str(owner)}],
+        }
+        record = await self.settings.find_one_and_update(
+            query,
+            {"$set": {"owner": str(owner), "lease_until": lease_until, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if record:
+            return True
+        try:
+            await self.settings.insert_one({
+                "_id": "global_rename_queue_lease",
+                "owner": str(owner),
+                "lease_until": lease_until,
+                "updated_at": now,
+            })
+            return True
+        except DuplicateKeyError:
+            return False
+
+    async def renew_queue_lease(self, owner: str, lease_seconds: int = 60) -> bool:
+        now = datetime.now(timezone.utc)
+        result = await self.settings.update_one(
+            {
+                "_id": "global_rename_queue_lease",
+                "owner": str(owner),
+                "lease_until": {"$gt": now},
+            },
+            {"$set": {"lease_until": now + timedelta(seconds=int(lease_seconds)), "updated_at": now}},
+        )
+        return result.matched_count == 1
+
+    async def release_queue_lease(self, owner: str) -> bool:
+        now = datetime.now(timezone.utc)
+        result = await self.settings.update_one(
+            {"_id": "global_rename_queue_lease", "owner": str(owner)},
+            {"$set": {"lease_until": now, "updated_at": now}},
+        )
+        return result.matched_count == 1
 
     async def get_output_jobs(self):
         """Jobs that were submitted (or whose callback result was uncertain) but lack output."""
