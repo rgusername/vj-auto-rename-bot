@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 
@@ -18,7 +19,6 @@ from config import (
     API_ID,
     ADMINS,
     MAX_RENAME_ATTEMPTS,
-    QUALITY_PRIORITY_ENABLED,
     RENAME_BOT_USERNAME,
     RENAME_RESPONSE_TIMEOUT,
     SESSION_OWNER_ID,
@@ -29,7 +29,6 @@ from plugins.filename_utils import (
     extract_video_metadata,
     format_standardized_filename,
     normalize_filename_key,
-    quality_priority,
     sanitize_filename,
     title_similarity,
 )
@@ -78,6 +77,9 @@ class RenameRuntime:
         self._submission_sequence = 0
         self._submission_event = asyncio.Event()
         self._submission_worker_task: asyncio.Task | None = None
+        self._queue_lease_owner = uuid.uuid4().hex
+        self._queue_lease_heartbeat_task: asyncio.Task | None = None
+        self._queue_lease_lost = asyncio.Event()
         self._queued_keys: set[tuple[int, int]] = set()
         self._jobs: dict[tuple[int, int], asyncio.Task] = {}
         self._retry_tasks: set[asyncio.Task] = set()
@@ -174,7 +176,6 @@ class RenameRuntime:
                 logger.info("RENAME_BOT_USERNAME is unset; saved session will be available for /set, but media monitoring is disabled.")
             self.user_client = client
             self.active_session_owner_id = owner_id
-            await db.recover_interrupted_jobs(MAX_RENAME_ATTEMPTS)
             logger.info("Logged-in user session started; monitoring configured source channels.")
             await self.resume_pending_jobs()
             return True
@@ -629,14 +630,15 @@ class RenameRuntime:
             job_id = job.get("job_id") or f"{source_id}:{message_id}"
             if context.get("superseded"):
                 logger.info("Not publishing output for superseded job=%s", job_id)
-                return
+                return False
             final_message = await self._wait_for_output_message(context, source_id, message_id)
             if context.get("superseded"):
                 logger.info("Keeping late output pending for superseded job=%s", job_id)
-                return
+                return False
             if not await db.begin_output_publish(source_id, message_id, int(final_message.id)):
                 logger.info("Output publication already claimed or job no longer eligible source=%s message=%s", source_id, message_id)
-                return
+                current = await db.get_job(source_id, message_id)
+                return bool(current and current.get("status") == "completed")
             context["publishing"] = True
             output_id = int(job["output_channel_id"])
             expected_filename = context.get("expected_filename") or job.get("expected_filename") or job.get("final_filename") or self._media_filename(final_message)
@@ -665,7 +667,7 @@ class RenameRuntime:
                     stage="publishing",
                     error=str(exc)[:1000],
                 )
-                return
+                return False
             await db.update_job(
                 source_id,
                 message_id,
@@ -693,6 +695,7 @@ class RenameRuntime:
                     await self.bot_client.send_message(ADMINS[0], f"Rename complete: <code>{expected_filename}</code>\nSource: <code>{source_id}/{message_id}</code>")
                 except Exception:
                     logger.debug("Could not send job-completion notification to the primary administrator.", exc_info=True)
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -700,6 +703,7 @@ class RenameRuntime:
             current = await db.get_job(source_id, message_id)
             if current and current.get("status") in {"submitted", "submission_unknown"}:
                 await db.update_job(source_id, message_id, status="failed", submission_status="failed", stage="rename_bot_error", error=str(exc)[:1000])
+            return False
         finally:
             if self._output_waiters.get(key) is context:
                 self._output_waiters.pop(key, None)
@@ -774,7 +778,14 @@ class RenameRuntime:
             return
         self._submission_worker_task = asyncio.create_task(self._submission_worker(), name="rename-submission-queue")
 
-    def _enqueue_job(self, source_id: int, message_id: int, metadata: dict | None = None) -> bool:
+    def _enqueue_job(
+        self,
+        source_id: int,
+        message_id: int,
+        metadata: dict | None = None,
+        *,
+        created_at: datetime | None = None,
+    ) -> bool:
         key = (int(source_id), int(message_id))
         current = self._jobs.get(key)
         if key in self._queued_keys or (current and not current.done()):
@@ -786,7 +797,9 @@ class RenameRuntime:
             "message_id": key[1],
             "metadata": dict(metadata or {}),
             "sequence": self._submission_sequence,
+            "created_at": created_at or datetime.now(timezone.utc),
         })
+        self._submission_items.sort(key=lambda item: (item["created_at"], item["sequence"]))
         self._queued_keys.add(key)
         self._submission_event.set()
         self._ensure_submission_worker()
@@ -795,51 +808,149 @@ class RenameRuntime:
     def _pop_next_submission(self) -> dict:
         if not self._submission_items:
             raise IndexError("The shared submission queue is empty.")
-        index = 0
-        if QUALITY_PRIORITY_ENABLED:
-            first_group = self._submission_items[0]["metadata"].get("group_key")
-            if first_group:
-                end = 1
-                while end < len(self._submission_items) and self._submission_items[end]["metadata"].get("group_key") == first_group:
-                    end += 1
-                index = min(
-                    range(end),
-                    key=lambda item_index: (
-                        quality_priority(self._submission_items[item_index]["metadata"]),
-                        self._submission_items[item_index]["sequence"],
-                    ),
-                )
-        return self._submission_items.pop(index)
+        return self._submission_items[0]
 
-    async def _submission_worker(self):
+    async def _queue_lease_heartbeat(self):
         try:
             while self.user_client and self.rename_bot_id:
-                if not self._submission_items:
-                    self._submission_event.clear()
-                    await self._submission_event.wait()
-                    continue
-                item = self._pop_next_submission()
-                key = item["key"]
-                self._queued_keys.discard(key)
-                task = asyncio.create_task(
-                    self._process_job(item["source_id"], item["message_id"]),
-                    name=f"rename-submit:{key[0]}:{key[1]}",
-                )
-                self._jobs[key] = task
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    if asyncio.current_task() and asyncio.current_task().cancelling():
-                        raise
-                    logger.info("Submission job cancelled; continuing shared queue source=%s message=%s", *key)
-                except Exception:
-                    logger.exception("Unexpected submission worker error source=%s message=%s; continuing queue.", *key)
-                finally:
-                    if self._jobs.get(key) is task:
-                        self._jobs.pop(key, None)
+                await asyncio.sleep(15)
+                if not await db.renew_queue_lease(self._queue_lease_owner, lease_seconds=60):
+                    logger.error("Lost the global MongoDB queue lease; stopping to prevent concurrent rename submissions.")
+                    self._queue_lease_lost.set()
+                    worker = self._submission_worker_task
+                    if worker and worker is not asyncio.current_task() and not worker.done():
+                        worker.cancel()
+                    return
         except asyncio.CancelledError:
             raise
+        except Exception:
+            logger.exception("Could not renew the global queue lease; stopping this worker for safety.")
+            self._queue_lease_lost.set()
+            worker = self._submission_worker_task
+            if worker and worker is not asyncio.current_task() and not worker.done():
+                worker.cancel()
+
+    async def _restore_queue_items(self):
+        cursor = await db.get_queue_jobs()
+        async for job in cursor:
+            source_id = int(job["source_channel_id"])
+            config = await db.get_channel_config(source_id)
+            if config and config.get("thumbnail"):
+                self._enqueue_job(
+                    source_id,
+                    int(job["source_message_id"]),
+                    job.get("media_metadata"),
+                    created_at=job.get("created_at"),
+                )
+
+    async def _restore_output_contexts(self):
+        for record in await db.get_matched_output_owners():
+            output_id = record.get("rename_bot_output_message_id")
+            if output_id is not None:
+                key = (int(record["source_channel_id"]), int(record["source_message_id"]))
+                self._matched_output_owners[int(output_id)] = key
+        superseded_jobs = await db.get_superseded_jobs()
+        async for job in superseded_jobs:
+            key = (int(job["source_channel_id"]), int(job["source_message_id"]))
+            context = self._register_output_waiter(job, accepting_output=False)
+            self._output_waiters.pop(key, None)
+            context["accepting_output"] = False
+            context["superseded"] = True
+            self._superseded_waiters[key] = context
+
+    async def _submission_worker(self):
+        heartbeat = None
+        lease_acquired = False
+        try:
+            while self.user_client and self.rename_bot_id:
+                if not await db.acquire_queue_lease(self._queue_lease_owner, lease_seconds=60):
+                    await asyncio.sleep(5)
+                    continue
+                lease_acquired = True
+                self._queue_lease_lost.clear()
+                heartbeat = asyncio.create_task(self._queue_lease_heartbeat(), name="rename-queue-lease-heartbeat")
+                async with self._accept_lock:
+                    await db.recover_interrupted_jobs(MAX_RENAME_ATTEMPTS)
+                    restored = await db.restore_superseded_output_jobs()
+                    if restored:
+                        logger.warning("Restored %s callback-uncertain job(s) as output-only without resubmission.", restored)
+                    await self._restore_output_contexts()
+                    await self._restore_queue_items()
+                await self._recover_recent_outputs()
+
+                while self.user_client and self.rename_bot_id and not self._queue_lease_lost.is_set():
+                    if not self._submission_items:
+                        self._submission_event.clear()
+                        if self._submission_items:
+                            continue
+                        await self._submission_event.wait()
+                        continue
+                    item = self._pop_next_submission()
+                    key = item["key"]
+                    current = await db.get_job(*key)
+                    if current and current.get("status") == "completed":
+                        if self._submission_items and self._submission_items[0] is item:
+                            self._submission_items.pop(0)
+                        self._queued_keys.discard(key)
+                        continue
+                    if current and current.get("stage") == "cancelled":
+                        if self._submission_items and self._submission_items[0] is item:
+                            self._submission_items.pop(0)
+                        self._queued_keys.discard(key)
+                        continue
+                    if current and current.get("status") == "failed":
+                        # Strict FIFO: an uncertain or failed file blocks all later files.
+                        await asyncio.sleep(5)
+                        continue
+                    task = asyncio.create_task(
+                        self._process_job(item["source_id"], item["message_id"]),
+                        name=f"rename-global-fifo:{key[0]}:{key[1]}",
+                    )
+                    self._jobs[key] = task
+                    try:
+                        delivered = await task
+                    except asyncio.CancelledError:
+                        if asyncio.current_task() and asyncio.current_task().cancelling():
+                            raise
+                        logger.warning("Rename job cancelled; retaining its FIFO position source=%s message=%s", *key)
+                        delivered = False
+                    except Exception:
+                        logger.exception("Unexpected FIFO job error source=%s message=%s; later jobs remain held.", *key)
+                        delivered = False
+                    finally:
+                        if self._jobs.get(key) is task:
+                            self._jobs.pop(key, None)
+                    current = await db.get_job(*key)
+                    if delivered and current and current.get("status") == "completed":
+                        if self._submission_items and self._submission_items[0] is item:
+                            self._submission_items.pop(0)
+                        self._queued_keys.discard(key)
+                        continue
+                    if current and current.get("status") == "pending" and current.get("stage") == "preflight":
+                        attempts = int(current.get("attempts", 1))
+                        if attempts < MAX_RENAME_ATTEMPTS:
+                            await asyncio.sleep(min(2 ** max(attempts, 1), 30))
+                            continue
+                    logger.error(
+                        "Global FIFO is held at source=%s message=%s status=%s stage=%s; later files will not start until this job is safely completed or cancelled.",
+                        *key,
+                        current.get("status") if current else "missing",
+                        current.get("stage") if current else "missing",
+                    )
+                    await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Global FIFO worker stopped unexpectedly.")
         finally:
+            if heartbeat and not heartbeat.done():
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+            if lease_acquired:
+                try:
+                    await db.release_queue_lease(self._queue_lease_owner)
+                except Exception:
+                    logger.exception("Could not release the global queue lease cleanly.")
             if self._submission_worker_task is asyncio.current_task():
                 self._submission_worker_task = None
                 if self.user_client and self.rename_bot_id and self._submission_items:
@@ -868,45 +979,10 @@ class RenameRuntime:
         self._enqueue_job(source_id, message_id)
 
     async def resume_pending_jobs(self):
-        if not self.user_client:
-            return
-        restored_superseded = await db.restore_superseded_output_jobs()
-        if restored_superseded:
-            logger.warning(
-                "Restored output tracking for %s previously superseded callback job(s) without restarting rename actions.",
-                restored_superseded,
-            )
-        for record in await db.get_matched_output_owners():
-            output_id = record.get("rename_bot_output_message_id")
-            if output_id is not None:
-                key = (int(record["source_channel_id"]), int(record["source_message_id"]))
-                self._matched_output_owners[int(output_id)] = key
-        pending_jobs = await db.get_pending_jobs()
-        async for job in pending_jobs:
-            source_id = int(job["source_channel_id"])
-            config = await db.get_channel_config(source_id)
-            if not config or not config.get("thumbnail"):
-                continue
-            self._enqueue_job(source_id, int(job["source_message_id"]), job.get("media_metadata"))
-
-        output_jobs = await db.get_output_jobs()
-        async for job in output_jobs:
-            source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
-            config = await db.get_channel_config(source_id)
-            if not config or not config.get("thumbnail"):
-                logger.error("Cannot restore output tracking: source=%s message=%s has no saved thumbnail.", source_id, message_id)
-                continue
-            context = self._register_output_waiter(job)
-            self._ensure_output_task(job, config, context)
-        superseded_jobs = await db.get_superseded_jobs()
-        async for job in superseded_jobs:
-            key = (int(job["source_channel_id"]), int(job["source_message_id"]))
-            context = self._register_output_waiter(job, accepting_output=False)
-            self._output_waiters.pop(key, None)
-            context["accepting_output"] = False
-            context["superseded"] = True
-            self._superseded_waiters[key] = context
-        await self._recover_recent_outputs()
+        if self.user_client and self.rename_bot_id:
+            async with self._accept_lock:
+                await self._restore_queue_items()
+            self._ensure_submission_worker()
 
     async def cancel_active(self) -> bool:
         active = [task for task in self._jobs.values() if not task.done()]
@@ -1298,49 +1374,58 @@ class RenameRuntime:
         try:
             job = await db.get_job(source_id, message_id)
             if not job:
-                return
+                return False
+            if job.get("status") == "completed":
+                return True
             if job.get("status") == "superseded":
-                logger.info("Skipping superseded submission job=%s", job.get("job_id") or f"{source_id}:{message_id}")
-                return
-            if int(job.get("attempts", 0)) >= MAX_RENAME_ATTEMPTS:
-                await db.update_job(source_id, message_id, status="failed", submission_status="failed", error="Maximum processing attempts reached.")
-                return
-            if not await db.claim_job(source_id, message_id):
-                return
-            output_context = self._register_output_waiter(job, accepting_output=False)
-            logger.info(
-                "Created in-memory output tracker and claimed persisted job=%s Channel %s source=%s message=%s destination=%s expected_filename=%s before rename-bot submission.",
-                job.get("job_id") or f"{source_id}:{message_id}",
-                job.get("source_channel_number", "?"),
-                source_id,
-                message_id,
-                job.get("output_channel_id"),
-                job.get("expected_filename") or "awaiting prompt filename",
-            )
+                return False
+            if job.get("status") == "failed":
+                return False
         except Exception:
             logger.exception("Could not load or claim persisted rename job source=%s message=%s", source_id, message_id)
-            return
+            return False
+
         try:
             config = await db.get_channel_config(source_id)
             if not config:
                 raise RuntimeError("Source-channel configuration was removed.")
-            source_message = await self.user_client.get_messages(source_id, message_id)
-            if not source_message or not (source_message.video or source_message.document):
-                raise RuntimeError("Source message is no longer available or is not a video/document.")
-            submission = await self._rename_conversation(source_message, config, job, output_context)
+            status = job.get("status")
+            if status == "pending":
+                if int(job.get("attempts", 0)) >= MAX_RENAME_ATTEMPTS:
+                    await db.update_job(source_id, message_id, status="failed", submission_status="failed", error="Maximum processing attempts reached.")
+                    return False
+                if not await db.claim_job(source_id, message_id):
+                    return False
+                output_context = self._register_output_waiter(job, accepting_output=False)
+                logger.info(
+                    "Claimed global FIFO job=%s Channel %s source=%s message=%s destination=%s; only this job may interact with the rename bot until published.",
+                    job.get("job_id") or f"{source_id}:{message_id}",
+                    job.get("source_channel_number", "?"),
+                    source_id,
+                    message_id,
+                    job.get("output_channel_id"),
+                )
+                source_message = await self.user_client.get_messages(source_id, message_id)
+                if not source_message or not (source_message.video or source_message.document):
+                    raise RuntimeError("Source message is no longer available or is not a video/document.")
+                submission = await self._rename_conversation(source_message, config, job, output_context)
+                current = await db.get_job(source_id, message_id)
+                if not current or current.get("status") == "superseded":
+                    logger.error("Job changed to a non-processable state during rename: %s", job.get("job_id"))
+                    return False
+                job["expected_filename"] = submission["expected_filename"]
+                output_context = submission["context"]
+            elif status in {"submitted", "submission_unknown"}:
+                output_context = self._register_output_waiter(job, accepting_output=True)
+                await self._recover_recent_outputs()
+            else:
+                logger.error("FIFO job has unexpected persistent state job=%s status=%s", job.get("job_id"), status)
+                return False
+
+            output_task = self._ensure_output_task(job, config, output_context)
+            await output_task
             current = await db.get_job(source_id, message_id)
-            if not current or current.get("status") == "superseded":
-                logger.info("Rename request became superseded before output tracking started job=%s", job.get("job_id"))
-                return
-            job["expected_filename"] = submission["expected_filename"]
-            self._ensure_output_task(job, config, submission["context"])
-            logger.info(
-                "Rename submission %s source=%s message=%s filename=%s; output tracking continues independently.",
-                "unconfirmed" if submission["submission_unknown"] else "acknowledged",
-                source_id,
-                message_id,
-                submission["expected_filename"],
-            )
+            return bool(current and current.get("status") == "completed")
         except asyncio.CancelledError:
             current = await db.get_job(source_id, message_id)
             if current and current.get("status") == "superseded":
@@ -1357,9 +1442,18 @@ class RenameRuntime:
                     context = self._output_waiters.pop(key)
                     if not context["future"].done():
                         context["future"].cancel()
+            elif self._stopping_session and stage in {"submitted", "submission_unknown"}:
+                await db.update_job(
+                    source_id,
+                    message_id,
+                    status="submission_unknown" if stage == "submission_unknown" else "submitted",
+                    submission_status="submission_unknown" if stage == "submission_unknown" else "submitted",
+                    publication_status="pending",
+                    error="Session stopped while waiting for the renamed output; restored without resubmitting.",
+                )
             else:
                 await db.update_job(source_id, message_id, status="failed", submission_status="failed", stage="cancelled", error="Cancelled by administrator.")
-            if key in self._output_waiters and stage not in {"callback_submitting", "callback_unknown"}:
+            if key in self._output_waiters and stage not in {"callback_submitting", "callback_unknown", "submitted", "submission_unknown"}:
                 context = self._output_waiters.pop(key)
                 if not context["future"].done():
                     context["future"].cancel()
@@ -1385,8 +1479,11 @@ class RenameRuntime:
                 )
                 config = await db.get_channel_config(source_id)
                 if current and config:
-                    self._ensure_output_task(current, config, self._output_waiters[key])
-                return
+                    output_task = self._ensure_output_task(current, config, self._output_waiters[key])
+                    await output_task
+                    final = await db.get_job(source_id, message_id)
+                    return bool(final and final.get("status") == "completed")
+                return False
             # Once the rename bot has seen any side effect, restarting the full
             # conversation can rename the same media again or repeat its callback.
             can_retry = self._safe_to_retry(stage, attempt_count)
@@ -1401,13 +1498,7 @@ class RenameRuntime:
             context = self._output_waiters.pop(key, None)
             if context and not context["future"].done():
                 context["future"].cancel()
-            if can_retry:
-                delay = min(2 ** max(attempt_count, 1), 30)
-                retry = asyncio.create_task(self._retry_after_delay(source_id, message_id, delay), name=f"rename-retry:{source_id}:{message_id}")
-                self._retry_tasks.add(retry)
-                self._retry_job_keys[retry] = key
-                retry.add_done_callback(self._retry_tasks.discard)
-                retry.add_done_callback(lambda completed: self._retry_job_keys.pop(completed, None))
+            return False
 
 
 rename_runtime = RenameRuntime()
