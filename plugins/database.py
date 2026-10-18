@@ -8,9 +8,6 @@ from pymongo.errors import DuplicateKeyError
 
 from config import DB_NAME, DB_URI
 
-_UNRESOLVED_REQUEST_STATES = ["pending", "processing", "submitting", "submitted", "submission_unknown"]
-
-
 class Database:
     def __init__(self, uri: str, database_name: str):
         # A harmless local default keeps module imports/test discovery credential-free;
@@ -32,6 +29,11 @@ class Database:
         await self.jobs.create_index([("source_channel_id", 1), ("source_message_id", 1)], unique=True)
         await self.jobs.create_index("status")
         await self.jobs.create_index([("status", 1), ("created_at", 1)])
+        await self.jobs.create_index(
+            "rename_bot_output_message_id",
+            unique=True,
+            partialFilterExpression={"rename_bot_output_message_id": {"$type": "number"}},
+        )
 
     def new_user(self, user_id: int, name: str) -> dict:
         return {"id": int(user_id), "name": name, "session": None}
@@ -219,61 +221,34 @@ class Database:
     async def get_job(self, source_id: int, message_id: int) -> dict | None:
         return await self.jobs.find_one({"source_channel_id": int(source_id), "source_message_id": int(message_id)})
 
-    async def supersede_older_requests(self, source_id: int | None = None, message_id: int | None = None) -> dict:
-        """Keep only the newest request eligible for rename output publication."""
-        latest = await self.jobs.find_one({}, sort=[("created_at", -1), ("_id", -1)])
-        if not latest:
-            return {"latest": None, "is_latest": False, "superseded_count": 0}
-
-        if source_id is not None and message_id is not None:
-            current = await self.get_job(source_id, message_id)
-            if not current:
-                return {"latest": latest, "is_latest": False, "superseded_count": 0}
-            is_latest = current.get("_id") == latest.get("_id")
-            if not is_latest:
-                current_result = await self.jobs.update_one(
-                    {"source_channel_id": int(source_id), "source_message_id": int(message_id), "status": {"$in": _UNRESOLVED_REQUEST_STATES}},
-                    {"$set": self._superseded_fields(latest.get("job_id"))},
-                )
-                older_result = await self.jobs.update_many(
-                    {
-                        "_id": {"$ne": latest["_id"]},
-                        "status": {"$in": _UNRESOLVED_REQUEST_STATES},
-                    },
-                    {"$set": self._superseded_fields(latest.get("job_id"))},
-                )
-                return {
-                    "latest": latest,
-                    "is_latest": False,
-                    "superseded_count": older_result.modified_count + current_result.modified_count,
-                }
-
-        result = await self.jobs.update_many(
-            {
-                "_id": {"$ne": latest["_id"]},
-                "status": {"$in": _UNRESOLVED_REQUEST_STATES},
-            },
-            {"$set": self._superseded_fields(latest.get("job_id"))},
-        )
-        return {"latest": latest, "is_latest": True, "superseded_count": result.modified_count}
-
-    @staticmethod
-    def _superseded_fields(superseded_by: str | None) -> dict:
-        now = datetime.now(timezone.utc)
-        return {
-            "status": "superseded",
-            "submission_status": "superseded",
-            "publication_status": "superseded",
-            "stage": "superseded",
-            "superseded_by_job_id": superseded_by,
-            "superseded_at": now,
-            "updated_at": now,
-        }
-
     async def get_superseded_jobs(self):
         return self.jobs.find({"status": "superseded"}).sort(
             [("superseded_at", -1), ("created_at", -1), ("_id", -1)]
-        ).limit(1000)
+        )
+
+    async def restore_superseded_output_jobs(self) -> int:
+        """Restore only superseded jobs known to have issued the callback; never replay rename actions."""
+        result = await self.jobs.update_many(
+            {"status": "superseded", "callback_attempted_at": {"$exists": True}},
+            {
+                "$set": {
+                    "status": "submission_unknown",
+                    "submission_status": "submission_unknown",
+                    "publication_status": "pending",
+                    "stage": "callback_unknown",
+                    "error": "Restored output tracking for a previously superseded callback; rename actions were not repeated.",
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        return int(result.modified_count)
+
+    async def get_matched_output_owners(self) -> list[dict]:
+        cursor = self.jobs.find(
+            {"rename_bot_output_message_id": {"$type": "number"}},
+            {"source_channel_id": 1, "source_message_id": 1, "rename_bot_output_message_id": 1},
+        )
+        return await cursor.to_list(length=None)
 
     async def add_superseded_output(self, source_id: int, message_id: int, output_message_id: int):
         await self.jobs.update_one(
@@ -337,26 +312,31 @@ class Database:
 
     async def begin_output_publish(self, source_id: int, message_id: int, output_message_id: int) -> bool:
         """Atomically fence the one output upload attempt for a submitted job."""
-        result = await self.jobs.update_one(
-            {
-                "source_channel_id": int(source_id),
-                "source_message_id": int(message_id),
-                "status": {"$in": ["submitted", "submission_unknown"]},
-            },
-            {
-                "$set": {
-                    "status": "publishing",
-                    "submission_status": "submitted",
-                    "publication_status": "publishing",
-                    "stage": "publishing",
-                    "output_candidate_message_id": int(output_message_id),
-                    "rename_bot_output_message_id": int(output_message_id),
-                    "publishing_started_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            },
-        )
-        return result.modified_count == 1
+        try:
+            result = await self.jobs.update_one(
+                {
+                    "source_channel_id": int(source_id),
+                    "source_message_id": int(message_id),
+                    "status": {"$in": ["submitted", "submission_unknown"]},
+                },
+                {
+                    "$set": {
+                        "status": "publishing",
+                        "submission_status": "submitted",
+                        "publication_status": "publishing",
+                        "stage": "publishing",
+                        "output_candidate_message_id": int(output_message_id),
+                        "rename_bot_output_message_id": int(output_message_id),
+                        "publishing_started_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            return result.modified_count == 1
+        except DuplicateKeyError:
+            # The same rename-bot message has already been assigned to another
+            # source job; never publish it twice or to a second destination.
+            return False
 
     async def add_output_reply_id(self, source_id: int, message_id: int, reply_id: int):
         await self.jobs.update_one(
