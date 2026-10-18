@@ -1,6 +1,7 @@
 import asyncio
 import io
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -247,43 +248,49 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
         for stage in ("thumbnail_sending", "media_sent", "filename_submitted", "callback_submitted", "publishing"):
             self.assertFalse(RenameRuntime._safe_to_retry(stage, 1), stage)
 
-    async def test_timeout_after_callback_does_not_requeue_same_rename_workflow(self):
+    async def test_callback_timeout_job_does_not_return_before_late_output_delivery(self):
         runtime = RenameRuntime()
-        source_message = SimpleNamespace(
-            video=SimpleNamespace(file_name="episode.mp4"),
-            document=None,
-        )
+        source_message = SimpleNamespace(video=SimpleNamespace(file_name="episode.mp4"), document=None)
         runtime.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=source_message))
-        runtime._rename_conversation = AsyncMock(side_effect=asyncio.TimeoutError("final media timed out"))
         job = {
             "source_channel_id": -100101,
             "source_message_id": 42,
             "attempts": 1,
             "output_channel_id": -100202,
             "expected_filename": "episode.mp4",
+            "status": "pending",
+            "stage": "queued",
         }
-        current = {
-            "source_channel_id": -100101,
-            "source_message_id": 42,
-            "attempts": 1,
-            "stage": "callback_unknown",
-            "status": "submission_unknown",
-        }
+        current = {**job, "status": "submission_unknown", "stage": "callback_unknown"}
+        completed = {**current, "status": "completed", "stage": "completed"}
+        context = {"future": asyncio.get_running_loop().create_future()}
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
 
-        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, current])), patch(
+        async def deliver():
+            delivery_started.set()
+            await release_delivery.wait()
+
+        delivery_task = asyncio.create_task(deliver())
+        runtime._rename_conversation = AsyncMock(return_value={
+            "context": context,
+            "expected_filename": "episode.mp4",
+            "submission_unknown": True,
+        })
+        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, current, completed])), patch(
             "plugins.rename_runtime.db.claim_job", new=AsyncMock(return_value=True)
         ), patch(
             "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
-        ), patch("plugins.rename_runtime.db.update_job", new=AsyncMock()) as update_job:
-            await runtime._process_job(-100101, 42)
+        ), patch.object(runtime, "_ensure_output_task", Mock(return_value=delivery_task)) as ensure_output:
+            processing = asyncio.create_task(runtime._process_job(-100101, 42))
+            await asyncio.wait_for(delivery_started.wait(), timeout=1)
+            self.assertFalse(processing.done())
+            runtime._rename_conversation.assert_awaited_once()
+            release_delivery.set()
+            self.assertTrue(await asyncio.wait_for(processing, timeout=1))
+        ensure_output.assert_called_once()
 
-        update_job.assert_awaited_once()
-        fields = update_job.await_args.kwargs
-        self.assertEqual(fields["status"], "submission_unknown")
-        self.assertEqual(fields["submission_status"], "submission_unknown")
-        self.assertEqual(fields["stage"], "callback_unknown")
-
-    async def test_acknowledged_submission_does_not_wait_for_output_media(self):
+    async def test_job_processing_waits_until_output_is_delivered(self):
         runtime = RenameRuntime()
         source_message = SimpleNamespace(video=SimpleNamespace(file_name="episode.mp4"), document=None)
         job = {
@@ -292,18 +299,33 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             "attempts": 1,
             "output_channel_id": -100202,
             "expected_filename": "episode.mp4",
+            "status": "pending",
+            "stage": "queued",
         }
         output_context = {"future": asyncio.get_running_loop().create_future()}
         submission = {"context": output_context, "expected_filename": "episode.mp4", "submission_unknown": False}
         runtime.user_client = SimpleNamespace(get_messages=AsyncMock(return_value=source_message))
         runtime._rename_conversation = AsyncMock(return_value=submission)
-        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, job])), patch(
+        submitted = {**job, "status": "submitted"}
+        completed = {**job, "status": "completed"}
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+
+        async def deliver():
+            delivery_started.set()
+            await release_delivery.wait()
+
+        delivery_task = asyncio.create_task(deliver())
+        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=[job, submitted, completed])), patch(
             "plugins.rename_runtime.db.claim_job", new=AsyncMock(return_value=True)
         ), patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})), patch.object(
             runtime, "_ensure_output_task"
-        ) as ensure_output:
-            await asyncio.wait_for(runtime._process_job(-100101, 43), timeout=0.5)
-        self.assertFalse(output_context["future"].done())
+        , Mock(return_value=delivery_task)) as ensure_output:
+            processing = asyncio.create_task(runtime._process_job(-100101, 43))
+            await asyncio.wait_for(delivery_started.wait(), timeout=1)
+            self.assertFalse(processing.done())
+            release_delivery.set()
+            self.assertTrue(await asyncio.wait_for(processing, timeout=1))
         ensure_output.assert_called_once_with(job, {"thumbnail": b"thumb"}, output_context)
 
     async def test_requesters_saved_session_is_restored_without_relogin(self):
@@ -314,7 +336,7 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await runtime.ensure_user_session(123))
         start_session.assert_awaited_once_with("saved-session", owner_id=123)
 
-    async def test_pending_jobs_coroutine_is_awaited_before_cursor_iteration(self):
+    async def test_persistent_global_fifo_cursor_is_awaited_and_restored_in_order(self):
         class AsyncCursor:
             def __init__(self, items):
                 self.items = iter(items)
@@ -330,27 +352,21 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
 
         runtime = RenameRuntime()
         runtime.user_client = object()
+        runtime.rename_bot_id = 999
         cursor = AsyncCursor([
-            {"source_channel_id": -100101, "source_message_id": 42},
-            {"source_channel_id": -100101, "source_message_id": 43},
+            {"source_channel_id": -100101, "source_message_id": 42, "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+            {"source_channel_id": -100101, "source_message_id": 43, "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc)},
         ])
-        with patch("plugins.rename_runtime.db.restore_superseded_output_jobs", new=AsyncMock(return_value=0)), patch(
-            "plugins.rename_runtime.db.get_matched_output_owners", new=AsyncMock(return_value=[])
-        ), patch(
-            "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([]))
-        ), patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=cursor)) as get_pending, patch(
+        with patch("plugins.rename_runtime.db.get_queue_jobs", new=AsyncMock(return_value=cursor)) as get_queue, patch(
             "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
-        ), patch("plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([]))), patch.object(
-            runtime, "_enqueue_job"
-        ) as enqueue_job:
+        ), patch.object(runtime, "_ensure_submission_worker") as ensure_worker:
             await runtime.resume_pending_jobs()
 
-        get_pending.assert_awaited_once_with()
-        self.assertEqual(enqueue_job.call_count, 2)
-        enqueue_job.assert_any_call(-100101, 42, None)
-        enqueue_job.assert_any_call(-100101, 43, None)
+        get_queue.assert_awaited_once_with()
+        ensure_worker.assert_called()
+        self.assertEqual([item["key"] for item in runtime._submission_items], [(-100101, 42), (-100101, 43)])
 
-    async def test_resume_restores_submitted_output_watchers_not_submissions(self):
+    async def test_resume_queues_submitted_output_before_later_jobs_without_detached_tracker(self):
         class AsyncCursor:
             def __init__(self, items):
                 self.items = iter(items)
@@ -366,32 +382,27 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
 
         runtime = RenameRuntime()
         runtime.user_client = object()
+        runtime.rename_bot_id = 999
         submitted = {
             "source_channel_id": 100,
             "source_message_id": 5,
             "output_channel_id": 900,
             "status": "submitted",
             "expected_filename": "restored.mp4",
+            "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
         }
-        context = {"future": asyncio.get_running_loop().create_future()}
-        with patch("plugins.rename_runtime.db.restore_superseded_output_jobs", new=AsyncMock(return_value=0)), patch(
-            "plugins.rename_runtime.db.get_matched_output_owners", new=AsyncMock(return_value=[])
-        ), patch(
-            "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([]))
-        ), patch("plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=AsyncCursor([]))), patch(
-            "plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([submitted]))
-        ), patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})), patch.object(
-            runtime, "_enqueue_job"
-        ) as enqueue, patch.object(runtime, "_register_output_waiter", return_value=context) as register, patch.object(
+        with patch("plugins.rename_runtime.db.get_queue_jobs", new=AsyncMock(return_value=AsyncCursor([submitted]))), patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
+        ), patch.object(runtime, "_ensure_submission_worker") as ensure_worker, patch.object(
             runtime, "_ensure_output_task"
-        ) as ensure_output, patch.object(runtime, "_recover_recent_outputs", new=AsyncMock()):
+        ) as ensure_output:
             await runtime.resume_pending_jobs()
 
-        enqueue.assert_not_called()
-        register.assert_called_once_with(submitted)
-        ensure_output.assert_called_once_with(submitted, {"thumbnail": b"thumb"}, context)
+        self.assertEqual([item["key"] for item in runtime._submission_items], [(100, 5)])
+        ensure_worker.assert_called()
+        ensure_output.assert_not_called()
 
-    async def test_resume_restores_superseded_jobs_only_as_stale_output_anchors(self):
+    async def test_restore_output_contexts_loads_owners_and_stale_anchors(self):
         class AsyncCursor:
             def __init__(self, items):
                 self.items = iter(items)
@@ -406,16 +417,6 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
                     raise StopAsyncIteration
 
         runtime = RenameRuntime()
-        runtime.user_client = object()
-        latest = {
-            "source_channel_id": 100,
-            "source_message_id": 6,
-            "job_id": "100:6",
-            "status": "submitted",
-            "expected_filename": "latest.mp4",
-            "output_reply_ids": [60],
-            "rename_bot_output_message_id": 66,
-        }
         old = {
             "source_channel_id": 100,
             "source_message_id": 1,
@@ -424,22 +425,16 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             "expected_filename": "old.mp4",
             "output_reply_ids": [10],
         }
-        with patch("plugins.rename_runtime.db.restore_superseded_output_jobs", new=AsyncMock(return_value=0)), patch(
-            "plugins.rename_runtime.db.get_matched_output_owners", new=AsyncMock(return_value=[{
+        with patch("plugins.rename_runtime.db.get_matched_output_owners", new=AsyncMock(return_value=[{
                 "source_channel_id": 100,
                 "source_message_id": 6,
                 "rename_bot_output_message_id": 66,
             }])
         ), patch(
-            "plugins.rename_runtime.db.get_pending_jobs", new=AsyncMock(return_value=AsyncCursor([]))
-        ), patch("plugins.rename_runtime.db.get_output_jobs", new=AsyncMock(return_value=AsyncCursor([latest]))), patch(
             "plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor([old]))
-        ), patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})), patch.object(
-            runtime, "_ensure_output_task"
-        ), patch.object(runtime, "_recover_recent_outputs", new=AsyncMock()):
-            await runtime.resume_pending_jobs()
+        ):
+            await runtime._restore_output_contexts()
 
-        self.assertIn((100, 6), runtime._output_waiters)
         self.assertIn((100, 1), runtime._superseded_waiters)
         self.assertEqual(runtime._matched_output_owners[66], (100, 6))
 
@@ -493,50 +488,92 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create_job.await_args_list[1].kwargs["expected_filename"], "[@tag] S1 Ep4 1080p.mkv")
         self.assertEqual(create_job.await_args_list[2].kwargs["expected_filename"], "[@tag] S1 Ep4 720p.mkv")
 
-    async def test_next_channel_submits_before_previous_output_is_available(self):
+    async def test_strict_fifo_ignores_quality_and_preserves_arrival_order(self):
         runtime = RenameRuntime()
-        runtime.user_client = SimpleNamespace()
+        runtime._enqueue_job(100, 1, extract_video_metadata("Show S01E01 1080p.mkv"))
+        runtime._enqueue_job(100, 2, extract_video_metadata("Show S01E01 720p.mkv"))
+        runtime._enqueue_job(100, 3, extract_video_metadata("Show S01E01 480p.mkv"))
+        runtime._enqueue_job(200, 4, extract_video_metadata("Different.Movie.1080p.mp4"))
+        self.assertEqual([item["key"] for item in runtime._submission_items], [
+            (100, 1), (100, 2), (100, 3), (200, 4),
+        ])
+
+    async def test_global_worker_processes_two_channels_A_through_F_serially(self):
+        class AsyncCursor:
+            def __init__(self, items=()):
+                self.items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        runtime = RenameRuntime()
+        jobs = {}
+        first_batch = [(100, 1), (100, 2), (100, 3)]
+        second_batch = [(200, 4), (200, 5), (200, 6)]
+        release = {key: asyncio.Event() for key in first_batch + second_batch}
+        started = []
+        started_events = {key: asyncio.Event() for key in first_batch + second_batch}
+
+        for index, key in enumerate(first_batch):
+            jobs[key] = {"source_channel_id": key[0], "source_message_id": key[1], "status": "pending", "stage": "queued"}
+            runtime._enqueue_job(*key, created_at=datetime(2026, 1, 1, 0, 0, index, tzinfo=timezone.utc))
+        for key in second_batch:
+            jobs[key] = {"source_channel_id": key[0], "source_message_id": key[1], "status": "pending", "stage": "queued"}
+
+        runtime.user_client = object()
         runtime.rename_bot_id = 999
-        first_started = asyncio.Event()
-        release_first_submission = asyncio.Event()
-        second_started = asyncio.Event()
-        submissions = []
-        slow_output_future = asyncio.get_running_loop().create_future()
 
-        async def submit(source_id, message_id):
-            submissions.append((source_id, message_id))
-            if message_id == 1:
-                first_started.set()
-                await release_first_submission.wait()
-                # Models A being accepted while its final file is still absent.
-                self.assertFalse(slow_output_future.done())
-            else:
-                second_started.set()
+        async def fake_process(source_id, message_id):
+            key = (source_id, message_id)
+            started.append(key)
+            started_events[key].set()
+            await release[key].wait()  # delivery gate: next job cannot start until publish succeeds
+            jobs[key]["status"] = "completed"
+            return True
 
-        runtime._process_job = submit
-        self.assertTrue(runtime._enqueue_job(100, 1))
-        await asyncio.wait_for(first_started.wait(), timeout=1)
-        self.assertFalse(runtime._enqueue_job(100, 1))
-        self.assertTrue(runtime._enqueue_job(200, 2))
-        release_first_submission.set()
-        await asyncio.wait_for(second_started.wait(), timeout=1)
-        self.assertEqual(submissions, [(100, 1), (200, 2)])
-        self.assertFalse(slow_output_future.done())
+        async def get_job(source_id, message_id):
+            return jobs[(source_id, message_id)]
 
-        worker = runtime._submission_worker_task
-        if worker and not worker.done():
+        with patch("plugins.rename_runtime.db.acquire_queue_lease", new=AsyncMock(return_value=True)), patch(
+            "plugins.rename_runtime.db.renew_queue_lease", new=AsyncMock(return_value=True)
+        ), patch("plugins.rename_runtime.db.release_queue_lease", new=AsyncMock(return_value=True)), patch(
+            "plugins.rename_runtime.db.recover_interrupted_jobs", new=AsyncMock()
+        ), patch("plugins.rename_runtime.db.restore_superseded_output_jobs", new=AsyncMock(return_value=0)), patch(
+            "plugins.rename_runtime.db.get_matched_output_owners", new=AsyncMock(return_value=[])
+        ), patch("plugins.rename_runtime.db.get_superseded_jobs", new=AsyncMock(return_value=AsyncCursor())), patch(
+            "plugins.rename_runtime.db.get_queue_jobs", new=AsyncMock(return_value=AsyncCursor())
+        ), patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=get_job)), patch.object(
+            runtime, "_recover_recent_outputs", new=AsyncMock()
+        ), patch.object(runtime, "_process_job", new=AsyncMock(side_effect=fake_process)):
+            worker = asyncio.create_task(runtime._submission_worker())
+            runtime._submission_worker_task = worker
+            await asyncio.wait_for(started_events[first_batch[0]].wait(), timeout=1)
+            # Channel 2 arrives while Channel 1's first file is still awaiting delivery.
+            for index, key in enumerate(second_batch, start=3):
+                runtime._enqueue_job(*key, created_at=datetime(2026, 1, 1, 0, 0, index, tzinfo=timezone.utc))
+            self.assertEqual(started, [first_batch[0]])
+
+            for key in first_batch + second_batch:
+                if not started_events[key].is_set():
+                    await asyncio.wait_for(started_events[key].wait(), timeout=1)
+                self.assertEqual(started[-1], key)
+                release[key].set()
+
+            for _ in range(20):
+                if not runtime._submission_items:
+                    break
+                await asyncio.sleep(0)
+            self.assertFalse(runtime._submission_items)
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
 
-    async def test_quality_priority_reorders_only_related_queued_variants(self):
-        runtime = RenameRuntime()
-        with patch("plugins.rename_runtime.QUALITY_PRIORITY_ENABLED", True):
-            runtime._enqueue_job(100, 1, extract_video_metadata("Show S01E01 1080p.mkv"))
-            runtime._enqueue_job(100, 2, extract_video_metadata("Show S01E01 720p.mkv"))
-            runtime._enqueue_job(100, 3, extract_video_metadata("Show S01E01 480p.mkv"))
-            runtime._enqueue_job(200, 4, extract_video_metadata("Different.Movie.1080p.mp4"))
-            ordered = [runtime._pop_next_submission()["message_id"] for _ in range(4)]
-        self.assertEqual(ordered, [3, 2, 1, 4])
+        self.assertEqual(started, first_batch + second_batch)
 
     async def test_out_of_order_rename_outputs_match_their_own_waiters(self):
         runtime = RenameRuntime()
@@ -1230,6 +1267,42 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await database.get_output_jobs()
         database.jobs.find.assert_called_once_with({"status": {"$in": ["submitted", "submission_unknown"]}})
         cursor.sort.assert_called_once_with([("submitted_at", 1), ("created_at", 1), ("_id", 1)])
+
+    async def test_global_queue_query_includes_pending_output_and_failed_barriers_in_fifo_order(self):
+        database = Database.__new__(Database)
+        cursor = SimpleNamespace(sort=Mock())
+        cursor.sort.return_value = cursor
+        database.jobs = SimpleNamespace(find=Mock(return_value=cursor))
+        self.assertIs(await database.get_queue_jobs(), cursor)
+        database.jobs.find.assert_called_once_with({
+            "status": {"$in": ["pending", "submitted", "submission_unknown", "failed"]},
+            "stage": {"$ne": "cancelled"},
+        })
+        cursor.sort.assert_called_once_with([("created_at", 1), ("_id", 1)])
+
+    async def test_global_queue_lease_is_owned_and_renewed_atomically(self):
+        database = Database.__new__(Database)
+        database.settings = SimpleNamespace(
+            find_one_and_update=AsyncMock(return_value={"owner": "worker-a"}),
+            insert_one=AsyncMock(),
+            update_one=AsyncMock(return_value=SimpleNamespace(matched_count=1)),
+        )
+        self.assertTrue(await database.acquire_queue_lease("worker-a", lease_seconds=60))
+        query = database.settings.find_one_and_update.await_args.args[0]
+        self.assertEqual(query["_id"], "global_rename_queue_lease")
+        self.assertEqual(query["$or"][1], {"owner": "worker-a"})
+        self.assertTrue(await database.renew_queue_lease("worker-a", lease_seconds=60))
+        self.assertTrue(await database.release_queue_lease("worker-a"))
+        self.assertEqual(database.settings.update_one.await_count, 2)
+
+    async def test_global_queue_lease_contention_does_not_overwrite_another_worker(self):
+        database = Database.__new__(Database)
+        database.settings = SimpleNamespace(
+            find_one_and_update=AsyncMock(return_value=None),
+            insert_one=AsyncMock(side_effect=DuplicateKeyError("lease exists")),
+        )
+        self.assertFalse(await database.acquire_queue_lease("worker-b", lease_seconds=60))
+        database.settings.insert_one.assert_awaited_once()
 
     async def test_matched_output_owner_lookup_restores_global_message_identity(self):
         owner = {
