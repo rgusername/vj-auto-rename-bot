@@ -1,7 +1,7 @@
 import asyncio
 import io
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -497,6 +497,55 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["key"] for item in runtime._submission_items], [
             (100, 1), (100, 2), (100, 3), (200, 4),
         ])
+
+    async def test_queue_sort_normalizes_mixed_naive_and_aware_datetimes_to_utc(self):
+        class AsyncCursor:
+            def __init__(self, items):
+                self.items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        runtime = RenameRuntime()
+        naive_utc = datetime(2026, 1, 1, 10, 0, 0)
+        aware_same_instant = datetime(2026, 1, 1, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        earlier_aware = datetime(2026, 1, 1, 9, 59, tzinfo=timezone.utc)
+
+        # Simulate an already-queued legacy item decoded by PyMongo as naive UTC.
+        runtime._submission_items.append({
+            "key": (100, 1),
+            "source_id": 100,
+            "message_id": 1,
+            "metadata": {},
+            "sequence": 1,
+            "created_at": naive_utc,
+        })
+        runtime._queued_keys.add((100, 1))
+        runtime._submission_sequence = 1
+
+        runtime._enqueue_job(100, 2, created_at=aware_same_instant)
+        runtime._enqueue_job(200, 3, created_at=earlier_aware)
+
+        persisted = [
+            {"source_channel_id": 300, "source_message_id": 4, "created_at": datetime(2026, 1, 1, 9, 58)},
+            {"source_channel_id": 300, "source_message_id": 5, "created_at": datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc)},
+        ]
+        with patch("plugins.rename_runtime.db.get_queue_jobs", new=AsyncMock(return_value=AsyncCursor(persisted))), patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"thumbnail": b"thumb"})
+        ):
+            await runtime._restore_queue_items()
+
+        self.assertEqual([item["key"] for item in runtime._submission_items], [
+            (300, 4), (200, 3), (100, 1), (100, 2), (300, 5),
+        ])
+        self.assertTrue(all(item["created_at"].tzinfo is timezone.utc for item in runtime._submission_items))
+        self.assertEqual(runtime._submission_items[2]["created_at"], runtime._submission_items[3]["created_at"])
 
     async def test_global_worker_processes_two_channels_A_through_F_serially(self):
         class AsyncCursor:
