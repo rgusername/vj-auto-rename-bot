@@ -778,6 +778,15 @@ class RenameRuntime:
             return
         self._submission_worker_task = asyncio.create_task(self._submission_worker(), name="rename-submission-queue")
 
+    @staticmethod
+    def _normalize_queue_datetime(value, *, fallback: datetime | None = None) -> datetime:
+        """Return a comparable UTC timestamp; Mongo's legacy naive dates mean UTC."""
+        if not isinstance(value, datetime):
+            value = fallback or datetime.now(timezone.utc)
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     def _enqueue_job(
         self,
         source_id: int,
@@ -791,14 +800,21 @@ class RenameRuntime:
         if key in self._queued_keys or (current and not current.done()):
             return False
         self._submission_sequence += 1
+        created_at = self._normalize_queue_datetime(created_at)
         self._submission_items.append({
             "key": key,
             "source_id": key[0],
             "message_id": key[1],
             "metadata": dict(metadata or {}),
             "sequence": self._submission_sequence,
-            "created_at": created_at or datetime.now(timezone.utc),
+            "created_at": created_at,
         })
+        # Normalize legacy/in-memory entries too, before Python compares sort keys.
+        for item in self._submission_items:
+            item["created_at"] = self._normalize_queue_datetime(
+                item.get("created_at"),
+                fallback=datetime.now(timezone.utc),
+            )
         self._submission_items.sort(key=lambda item: (item["created_at"], item["sequence"]))
         self._queued_keys.add(key)
         self._submission_event.set()
@@ -840,7 +856,7 @@ class RenameRuntime:
                     source_id,
                     int(job["source_message_id"]),
                     job.get("media_metadata"),
-                    created_at=job.get("created_at"),
+                    created_at=self._normalize_queue_datetime(job.get("created_at")),
                 )
 
     async def _restore_output_contexts(self):
