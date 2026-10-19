@@ -74,6 +74,8 @@ class RenameRuntime:
         self._rename_messages = asyncio.Queue()
         self._conversation_lock = asyncio.Lock()
         self._accept_lock = asyncio.Lock()
+        self._queue_clear_lock = asyncio.Lock()
+        self._queue_clearing = False
         self._submission_items: list[dict] = []
         self._submission_sequence = 0
         self._submission_event = asyncio.Event()
@@ -795,6 +797,9 @@ class RenameRuntime:
             original_caption = getattr(message, "caption", None)
             media_metadata = extract_video_metadata(original_filename, original_caption)
             async with self._accept_lock:
+                if self._queue_clearing:
+                    logger.info("Ignoring source message during global queue clear source=%s message=%s", source_id, message_id)
+                    return
                 config = await db.get_channel_config(source_id)
                 if not config:
                     return
@@ -830,7 +835,7 @@ class RenameRuntime:
         )
 
     def _ensure_submission_worker(self):
-        if not self.user_client or not self.rename_bot_id:
+        if self._queue_clearing or not self.user_client or not self.rename_bot_id:
             logger.debug(
                 "Global FIFO worker not started yet (user_session=%s rename_bot=%s); queued jobs remain durable and will resume when ready.",
                 bool(self.user_client),
@@ -860,6 +865,9 @@ class RenameRuntime:
         created_at: datetime | None = None,
     ) -> bool:
         key = (int(source_id), int(message_id))
+        if self._queue_clearing:
+            logger.info("Ignoring FIFO enqueue while global queue clear is in progress source=%s message=%s", *key)
+            return False
         current = self._jobs.get(key)
         if key in self._queued_keys or (current and not current.done()):
             return False
@@ -901,7 +909,7 @@ class RenameRuntime:
     async def _queue_lease_heartbeat(self):
         try:
             while self.user_client and self.rename_bot_id:
-                await asyncio.sleep(15)
+                await asyncio.sleep(2)
                 if not await db.renew_queue_lease(self._queue_lease_owner, lease_seconds=60):
                     logger.error("Lost the global MongoDB queue lease; stopping to prevent concurrent rename submissions.")
                     self._queue_lease_lost.set()
@@ -919,8 +927,13 @@ class RenameRuntime:
                 worker.cancel()
 
     async def _restore_queue_items(self):
+        if self._queue_clearing:
+            logger.info("Skipping persistent FIFO restoration while global queue clear is in progress.")
+            return
         cursor = await db.get_queue_jobs()
         async for job in cursor:
+            if self._queue_clearing:
+                return
             source_id = int(job["source_channel_id"])
             config = await db.get_channel_config(source_id)
             if config:
@@ -956,7 +969,7 @@ class RenameRuntime:
         heartbeat = None
         lease_acquired = False
         try:
-            while self.user_client and self.rename_bot_id:
+            while self.user_client and self.rename_bot_id and not self._queue_clearing:
                 if not await db.acquire_queue_lease(self._queue_lease_owner, lease_seconds=60):
                     await asyncio.sleep(5)
                     continue
@@ -973,7 +986,7 @@ class RenameRuntime:
                     await self._restore_queue_items()
                 await self._recover_recent_outputs()
 
-                while self.user_client and self.rename_bot_id and not self._queue_lease_lost.is_set():
+                while self.user_client and self.rename_bot_id and not self._queue_lease_lost.is_set() and not self._queue_clearing:
                     if not self._submission_items:
                         self._submission_event.clear()
                         if self._submission_items:
@@ -1062,7 +1075,7 @@ class RenameRuntime:
                     logger.exception("Could not release the global queue lease cleanly.")
             if self._submission_worker_task is asyncio.current_task():
                 self._submission_worker_task = None
-                if self.user_client and self.rename_bot_id and self._submission_items:
+                if self.user_client and self.rename_bot_id and self._submission_items and not self._queue_clearing:
                     self._ensure_submission_worker()
 
     async def _retry_after_delay(self, source_id: int, message_id: int, delay: float):
@@ -1092,6 +1105,117 @@ class RenameRuntime:
             async with self._accept_lock:
                 await self._restore_queue_items()
             self._ensure_submission_worker()
+
+    async def clear_queue(self) -> dict:
+        """Cancel local queue work and delete all persisted non-completed jobs."""
+        async with self._queue_clear_lock:
+            self._queue_clearing = True
+            distributed_fence_acquired = False
+            try:
+                previous_lease = await db.begin_queue_clear(self._queue_lease_owner)
+                if previous_lease is None:
+                    raise RuntimeError("Another administrator is already clearing the global rename queue.")
+                distributed_fence_acquired = True
+                previous_owner = previous_lease.get("owner") if isinstance(previous_lease, dict) else None
+                previous_until = previous_lease.get("lease_until") if isinstance(previous_lease, dict) else None
+                if isinstance(previous_until, datetime):
+                    previous_until = self._normalize_queue_datetime(previous_until)
+                else:
+                    previous_until = datetime.min.replace(tzinfo=timezone.utc)
+                remote_worker_active = bool(
+                    previous_owner
+                    and previous_owner != self._queue_lease_owner
+                    and previous_until > datetime.now(timezone.utc)
+                )
+                if remote_worker_active:
+                    # Remote workers renew every two seconds. Give them a
+                    # heartbeat window to observe the fencing token and cancel
+                    # their active coroutine before its job record is deleted.
+                    await asyncio.sleep(2.1)
+                async with self._accept_lock:
+                    queued_keys = {tuple(item["key"]) for item in self._submission_items}
+                    active_keys = {key for key, task in self._jobs.items() if not task.done()}
+                    active_stages = []
+                    for source_id, message_id in active_keys:
+                        try:
+                            active_job = await db.get_job(source_id, message_id)
+                            if active_job:
+                                active_stages.append(str(active_job.get("stage") or "queued"))
+                        except Exception:
+                            logger.exception("Could not inspect active job before clearing source=%s message=%s", source_id, message_id)
+                            active_stages.append("unknown")
+
+                    tasks = {
+                        task
+                        for task in (
+                            list(self._jobs.values())
+                            + list(self._output_tasks.values())
+                            + list(self._retry_tasks)
+                            + list(self._background_db_tasks)
+                            + ([self._submission_worker_task] if self._submission_worker_task else [])
+                        )
+                        if task and not task.done() and task is not asyncio.current_task()
+                    }
+                    for task in tasks:
+                        task.cancel()
+                    if tasks:
+                        _done, still_running = await asyncio.wait(tasks, timeout=5)
+                    else:
+                        still_running = set()
+
+                    # A cancellation after external interaction cannot retract
+                    # a Telegram request already accepted by the rename bot.
+                    side_effect_stages = {
+                        "thumbnail_sending", "thumbnail_sent", "media_sending", "media_sent",
+                        "filename_prompt_received", "filename_sending", "filename_submitted",
+                        "menu_received", "callback_submitting", "callback_unknown", "submitted",
+                        "publishing",
+                    }
+                    active_could_not_cancel = (
+                        remote_worker_active
+                        or bool(still_running)
+                        or any(stage in side_effect_stages for stage in active_stages)
+                    )
+
+                    cleared_jobs = await db.clear_queue_jobs()
+
+                    stale_entries = len(queued_keys | active_keys)
+                    self._submission_items.clear()
+                    self._queued_keys.clear()
+                    self._submission_event.clear()
+                    self._jobs.clear()
+                    self._output_tasks.clear()
+                    self._retry_tasks.clear()
+                    self._retry_job_keys.clear()
+                    self._background_db_tasks.clear()
+                    self._unmatched_outputs.clear()
+                    for context in list(self._output_waiters.values()) + list(self._superseded_waiters.values()):
+                        future = context.get("future")
+                        if future and not future.done():
+                            future.cancel()
+                    self._output_waiters.clear()
+                    self._superseded_waiters.clear()
+                    self._matched_output_owners.clear()
+
+                    logger.warning(
+                        "Global rename queue cleared: persistent_jobs=%s in_memory_entries=%s active_keys=%s active_could_not_cancel=%s",
+                        cleared_jobs,
+                        stale_entries,
+                        len(active_keys),
+                        active_could_not_cancel,
+                    )
+                    return {
+                        "cleared_jobs": int(cleared_jobs),
+                        "stale_queue_entries": stale_entries,
+                        "active_job_could_not_cancel": active_could_not_cancel,
+                        "active_job_count": len(active_keys) + int(remote_worker_active),
+                    }
+            finally:
+                try:
+                    if distributed_fence_acquired:
+                        await db.end_queue_clear(self._queue_lease_owner)
+                finally:
+                    self._queue_clearing = False
 
     async def cancel_active(self) -> bool:
         active = [task for task in self._jobs.values() if not task.done()]
