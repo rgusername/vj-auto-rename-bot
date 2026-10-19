@@ -11,7 +11,7 @@ from pyrogram import enums
 from pyrogram.errors import BotResponseTimeout
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from plugins.commands import _normalize_thumbnail
+from plugins.commands import _normalize_thumbnail, clear_queue as clear_queue_command
 from config import DB_NAME
 from plugins.database import Database
 from plugins.filename_utils import (
@@ -121,6 +121,36 @@ class KeyboardTests(unittest.TestCase):
         ])
         with self.assertRaises(ValueError):
             select_second_inline_button(markup)
+
+
+class ClearCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clear_command_is_admin_only_and_reports_results(self):
+        reply_text = AsyncMock()
+        message = SimpleNamespace(reply_text=reply_text)
+        with patch("plugins.commands._require_admin", new=AsyncMock(return_value=False)) as require_admin, patch(
+            "plugins.commands.rename_runtime.clear_queue", new=AsyncMock()
+        ) as clear_queue:
+            await clear_queue_command(None, message)
+        require_admin.assert_awaited_once_with(message)
+        clear_queue.assert_not_awaited()
+
+        reply_text.reset_mock()
+        with patch("plugins.commands._require_admin", new=AsyncMock(return_value=True)), patch(
+            "plugins.commands.rename_runtime.clear_queue",
+            new=AsyncMock(return_value={
+                "cleared_jobs": 4,
+                "stale_queue_entries": 3,
+                "active_job_could_not_cancel": True,
+                "active_job_count": 1,
+            }),
+        ) as clear_queue:
+            await clear_queue_command(None, message)
+        clear_queue.assert_awaited_once_with()
+        reply_text.assert_awaited_once()
+        response = reply_text.await_args.args[0]
+        self.assertIn("Persistent non-completed jobs removed: <b>4</b>", response)
+        self.assertIn("Stale in-memory queue entries removed: <b>3</b>", response)
+        self.assertIn("could not be safely cancelled", response)
 
 
 class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
@@ -460,6 +490,90 @@ class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clear_queue_removes_jobs_across_channels_and_blocks_restore(self):
+        class AsyncCursor:
+            def __init__(self, items=()):
+                self.items = iter(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        runtime = RenameRuntime()
+        for key in ((100, 1), (100, 2), (200, 3)):
+            runtime._submission_sequence += 1
+            runtime._submission_items.append({
+                "key": key,
+                "source_id": key[0],
+                "message_id": key[1],
+                "metadata": {},
+                "sequence": runtime._submission_sequence,
+                "created_at": datetime.now(timezone.utc),
+            })
+            runtime._queued_keys.add(key)
+
+        active_cancelled = asyncio.Event()
+
+        async def active_job():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                active_cancelled.set()
+                raise
+
+        active_task = asyncio.create_task(active_job())
+        await asyncio.sleep(0)
+        runtime._jobs[(200, 4)] = active_task
+        active_context = runtime._register_output_waiter({
+            "source_channel_id": 200,
+            "source_message_id": 4,
+            "status": "pending",
+        }, accepting_output=False)
+
+        with patch("plugins.rename_runtime.db.begin_queue_clear", new=AsyncMock(return_value={})), patch(
+            "plugins.rename_runtime.db.end_queue_clear", new=AsyncMock(return_value=True)
+        ), patch("plugins.rename_runtime.db.get_job", new=AsyncMock(return_value={"stage": "preflight"})), patch(
+            "plugins.rename_runtime.db.clear_queue_jobs", new=AsyncMock(return_value=4)
+        ) as clear_db, patch(
+            "plugins.rename_runtime.db.get_queue_jobs", new=AsyncMock(return_value=AsyncCursor())
+        ):
+            result = await runtime.clear_queue()
+            await runtime._restore_queue_items()
+
+        clear_db.assert_awaited_once_with()
+        self.assertTrue(active_cancelled.is_set())
+        self.assertEqual(result["cleared_jobs"], 4)
+        self.assertEqual(result["stale_queue_entries"], 4)
+        self.assertFalse(result["active_job_could_not_cancel"])
+        self.assertEqual(result["active_job_count"], 1)
+        self.assertEqual(runtime._submission_items, [])
+        self.assertEqual(runtime._queued_keys, set())
+        self.assertEqual(runtime._jobs, {})
+        self.assertEqual(runtime._output_waiters, {})
+        self.assertTrue(active_context["future"].cancelled())
+
+    async def test_source_arrival_is_not_persisted_while_clear_fence_is_active(self):
+        runtime = RenameRuntime()
+        runtime._queue_clearing = True
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=100, type=enums.ChatType.CHANNEL),
+            id=9,
+            video=SimpleNamespace(file_name="episode.mp4"),
+            document=None,
+            caption=None,
+        )
+        with patch("plugins.rename_runtime.db.get_channel_config", new=AsyncMock()) as get_config, patch(
+            "plugins.rename_runtime.db.create_job", new=AsyncMock()
+        ) as create_job:
+            await runtime._on_source_message(None, message)
+        get_config.assert_not_awaited()
+        create_job.assert_not_awaited()
+
     async def test_idle_worker_wakes_and_submits_first_new_source_job(self):
         class AsyncCursor:
             def __init__(self, items=()):
@@ -1386,6 +1500,37 @@ class DatabaseMappingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clear_queue_deletes_only_noncompleted_jobs_from_jobs_collection(self):
+        database = Database.__new__(Database)
+        database.jobs = SimpleNamespace(delete_many=AsyncMock(return_value=SimpleNamespace(deleted_count=5)))
+        self.assertEqual(await database.clear_queue_jobs(), 5)
+        database.jobs.delete_many.assert_awaited_once_with({"status": {"$ne": "completed"}})
+
+    async def test_clear_fence_displaces_worker_and_blocks_lease_renewal_until_released(self):
+        database = Database.__new__(Database)
+        previous = {
+            "_id": "global_rename_queue_lease",
+            "owner": "worker-old",
+            "lease_until": datetime.now(timezone.utc) + timedelta(seconds=30),
+        }
+        database.settings = SimpleNamespace(
+            find_one_and_update=AsyncMock(return_value=previous),
+            update_one=AsyncMock(return_value=SimpleNamespace(matched_count=1, modified_count=1)),
+            insert_one=AsyncMock(),
+        )
+        self.assertEqual(await database.begin_queue_clear("clear-owner"), previous)
+        query, update = database.settings.find_one_and_update.await_args.args[:2]
+        self.assertEqual(query["_id"], "global_rename_queue_lease")
+        self.assertEqual(update["$set"]["clearing"], True)
+        self.assertEqual(update["$set"]["owner"], "clear-owner")
+        self.assertTrue(await database.renew_queue_lease("worker-old"))
+        renew_query = database.settings.update_one.await_args_list[0].args[0]
+        self.assertEqual(renew_query["clearing"], {"$ne": True})
+        self.assertTrue(await database.end_queue_clear("clear-owner"))
+        end_query, end_update = database.settings.update_one.await_args_list[1].args
+        self.assertEqual(end_query["clear_owner"], "clear-owner")
+        self.assertFalse(end_update["$set"]["clearing"])
+
     async def test_claim_is_atomic_against_pending_status(self):
         database = Database.__new__(Database)
         database.jobs = SimpleNamespace(update_one=AsyncMock(side_effect=[
