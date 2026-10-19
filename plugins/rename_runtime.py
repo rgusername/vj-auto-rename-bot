@@ -5,7 +5,6 @@ import io
 import logging
 import os
 import re
-import tempfile
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -29,19 +28,14 @@ from plugins.filename_utils import (
     extract_video_metadata,
     format_standardized_filename,
     normalize_filename_key,
-    sanitize_filename,
     title_similarity,
 )
 
 logger = logging.getLogger(__name__)
-_VIDEO_EXTENSIONS = frozenset({
-    ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg",
-    ".ogv", ".ts", ".webm", ".wmv",
-})
 _UNMATCHED_OUTPUT_MAX = 100
 _UNMATCHED_OUTPUT_TTL_SECONDS = 3600
 _OUTPUT_RECOVERY_POLL_SECONDS = 15
-_CAPTION_UNSET = object()
+
 
 
 def select_second_inline_button(markup):
@@ -702,28 +696,25 @@ class RenameRuntime:
                     output_id,
                     expected_filename,
                 )
-                uploaded = await self._publish_result(
-                    final_message,
-                    output_id,
-                    config.get("thumbnail"),
-                    expected_filename,
-                    caption=job.get("original_caption") if job.get("original_caption") is not None else _CAPTION_UNSET,
-                )
+                copied_message = await self._publish_result(final_message, output_id)
             except Exception as exc:
                 logger.exception(
-                    "Output upload failed job=%s Channel %s source=%s message=%s destination=%s",
+                    "Server-side copy_message failed job=%s Channel %s source=%s message=%s destination=%s rename_bot_chat=%s rename_bot_message=%s; preserving the submitted job for output-only recovery.",
                     job.get("job_id") or f"{source_id}:{message_id}",
                     job.get("source_channel_number", "?"),
                     source_id,
                     message_id,
                     output_id,
+                    getattr(getattr(final_message, "chat", None), "id", None),
+                    getattr(final_message, "id", None),
                 )
                 await db.update_job(
                     source_id,
                     message_id,
-                    status="failed",
-                    publication_status="failed",
-                    stage="publishing",
+                    status="submitted",
+                    submission_status="submitted",
+                    publication_status="pending",
+                    stage="copy_retry",
                     error=str(exc)[:1000],
                 )
                 return False
@@ -733,8 +724,8 @@ class RenameRuntime:
                 status="completed",
                 publication_status="published",
                 stage="completed",
-                output_message_id=uploaded.id,
-                destination_message_id=uploaded.id,
+                output_message_id=copied_message.id,
+                destination_message_id=copied_message.id,
                 rename_bot_output_message_id=int(final_message.id),
                 error=None,
                 completed_at=datetime.now(timezone.utc),
@@ -746,7 +737,7 @@ class RenameRuntime:
                 source_id,
                 message_id,
                 output_id,
-                uploaded.id,
+                copied_message.id,
                 expected_filename,
             )
             if self.bot_client and ADMINS:
@@ -1548,73 +1539,25 @@ class RenameRuntime:
                 "submission_unknown": callback_unknown,
             }
 
-    async def _publish_result(
-        self,
-        final_message,
-        output_id: int,
-        thumbnail: bytes | None,
-        expected_filename: str,
-        *,
-        caption=_CAPTION_UNSET,
-    ):
-        video_media = final_message.video
-        document_media = final_message.document
-        media = video_media or document_media
-        if media is None:
-            raise RuntimeError("The rename bot did not return a video or document to publish.")
-        if not thumbnail:
-            raise RuntimeError("No thumbnail is configured; refusing to publish without the configured thumbnail.")
-
-        filename = sanitize_filename(expected_filename or getattr(media, "file_name", None) or "renamed_file")
-        mime_type = (getattr(media, "mime_type", None) or "").lower()
-        extension = os.path.splitext(filename)[1].lower()
-        is_video = bool(video_media) or bool(
-            document_media and (mime_type.startswith("video/") or extension in _VIDEO_EXTENSIONS)
+    async def _publish_result(self, final_message, output_id: int):
+        """Copy the rename bot's existing Telegram message without downloading media bytes."""
+        if not (getattr(final_message, "video", None) or getattr(final_message, "document", None)):
+            raise RuntimeError("The rename bot's result message does not contain a video or document.")
+        source_chat_id = getattr(getattr(final_message, "chat", None), "id", None)
+        source_message_id = getattr(final_message, "id", None)
+        if source_chat_id is None or source_message_id is None:
+            raise RuntimeError("The rename bot result is missing its source chat ID or message ID; refusing to copy another message.")
+        copied = await self._bounded_flood_retry(
+            self.user_client.copy_message,
+            int(output_id),
+            int(source_chat_id),
+            int(source_message_id),
         )
-        with tempfile.TemporaryDirectory(prefix="vjrename-") as tmpdir:
-            source_path = os.path.join(tmpdir, filename)
-            downloaded = await final_message.download(file_name=source_path)
-            if not downloaded:
-                raise RuntimeError("Could not download the rename bot's final media for upload.")
-            thumb = io.BytesIO(bytes(thumbnail))
-            thumb.name = "thumbnail.jpg"
-            preserve_output_caption = caption is _CAPTION_UNSET
-            send_options = {
-                "caption": (final_message.caption or "") if preserve_output_caption else (caption or ""),
-                "thumb": thumb,
-                "file_name": filename,
-            }
-            caption_entities = getattr(final_message, "caption_entities", None) if preserve_output_caption else None
-            if caption_entities:
-                send_options["caption_entities"] = caption_entities
-
-            if is_video:
-                send_video = video_media or document_media
-                for field in ("duration", "width", "height"):
-                    value = getattr(send_video, field, None)
-                    if value is not None:
-                        send_options[field] = value
-                send_options["supports_streaming"] = bool(getattr(send_video, "supports_streaming", True))
-                has_spoiler = getattr(final_message, "has_media_spoiler", None)
-                if has_spoiler is not None:
-                    send_options["has_spoiler"] = bool(has_spoiler)
-                uploaded = await self._bounded_flood_retry(
-                    self.user_client.send_video,
-                    output_id,
-                    downloaded,
-                    **send_options,
-                )
-            else:
-                uploaded = await self._bounded_flood_retry(
-                    self.user_client.send_document,
-                    output_id,
-                    downloaded,
-                    **send_options,
-                )
-
-            if uploaded is None or not getattr(uploaded, "id", None):
-                raise RuntimeError("Telegram did not confirm successful delivery of the renamed media.")
-            return uploaded
+        if copied is None or not getattr(copied, "id", None):
+            raise RuntimeError(
+                f"Telegram copy_message returned no destination message for source {source_chat_id}/{source_message_id}."
+            )
+        return copied
 
     async def _process_job(self, source_id: int, message_id: int):
         key = (int(source_id), int(message_id))
