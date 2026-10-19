@@ -440,7 +440,7 @@ class Database:
         )
 
     async def begin_output_publish(self, source_id: int, message_id: int, output_message_id: int) -> bool:
-        """Atomically fence the one output upload attempt for a submitted job."""
+        """Atomically claim copying one matched rename-bot message to its destination."""
         try:
             result = await self.jobs.update_one(
                 {
@@ -497,7 +497,7 @@ class Database:
             {
                 "status": "publishing",
             },
-            {"$set": {"status": "failed", "publication_status": "failed", "stage": "publishing", "error": "Interrupted during output publish; inspect output channel before manual retry.", "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {"status": "submitted", "submission_status": "submitted", "publication_status": "pending", "stage": "copy_retry", "error": "Interrupted during server-side result copy; output-only recovery will retry the stored rename-bot message without resubmitting the rename workflow.", "updated_at": datetime.now(timezone.utc)}},
         )
         # Older records have no separate submission/output checkpoints. An attempted
         # legacy workflow is fenced instead of blindly restarting its callback.
