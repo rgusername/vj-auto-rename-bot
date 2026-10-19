@@ -213,3 +213,30 @@ async def cancel(client, message):
         return
     active = await rename_runtime.cancel_active()
     await message.reply_text("Cancelled active rename operation(s)." if active else "No active rename operation was running.")
+
+
+@Client.on_message(filters.command("clear") & filters.private)
+async def clear_queue(client, message):
+    if not await _require_admin(message):
+        return
+    try:
+        result = await rename_runtime.clear_queue()
+    except Exception:
+        logger.exception("Could not clear the global rename queue from MongoDB.")
+        return await message.reply_text("Could not clear the queue in the database. No successful clear is being reported; please check the database and try again.")
+
+    lines = [
+        "<b>Global rename queue cleared.</b>",
+        f"Persistent non-completed jobs removed: <b>{result['cleared_jobs']}</b>",
+        f"Stale in-memory queue entries removed: <b>{result['stale_queue_entries']}</b>",
+    ]
+    if result["active_job_could_not_cancel"]:
+        lines.append(
+            f"Active job: <b>could not be safely cancelled</b> ({result['active_job_count']} active); "
+            "a Telegram request may already be processing remotely."
+        )
+    elif result["active_job_count"]:
+        lines.append(f"Active job: stopped locally ({result['active_job_count']} active).")
+    else:
+        lines.append("Active job: none.")
+    await message.reply_text("\n".join(lines))
