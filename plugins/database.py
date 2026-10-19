@@ -313,12 +313,24 @@ class Database:
             }
         ).sort([("created_at", 1), ("_id", 1)])
 
+    async def clear_queue_jobs(self) -> int:
+        """Delete queued/in-flight job records while preserving completed history.
+
+        Submission checkpoints and output anchors are stored on the job document,
+        so deleting non-completed records also removes their stale durable queue
+        state. Channel mappings, sessions, settings, and completed jobs live in
+        other documents and are not touched.
+        """
+        result = await self.jobs.delete_many({"status": {"$ne": "completed"}})
+        return int(result.deleted_count)
+
     async def acquire_queue_lease(self, owner: str, lease_seconds: int = 60) -> bool:
         """Atomically acquire or refresh the singleton cross-instance queue lease."""
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(seconds=int(lease_seconds))
         query = {
             "_id": "global_rename_queue_lease",
+            "clearing": {"$ne": True},
             "$or": [{"lease_until": {"$lte": now}}, {"owner": str(owner)}],
         }
         record = await self.settings.find_one_and_update(
@@ -345,11 +357,73 @@ class Database:
             {
                 "_id": "global_rename_queue_lease",
                 "owner": str(owner),
+                "clearing": {"$ne": True},
                 "lease_until": {"$gt": now},
             },
             {"$set": {"lease_until": now + timedelta(seconds=int(lease_seconds)), "updated_at": now}},
         )
         return result.matched_count == 1
+
+    async def begin_queue_clear(self, owner: str, lease_seconds: int = 120) -> dict | None:
+        """Fence queue workers and return the lease record that was displaced."""
+        now = datetime.now(timezone.utc)
+        query = {
+            "_id": "global_rename_queue_lease",
+            "$or": [
+                {"clearing": {"$ne": True}},
+                {"clear_lease_until": {"$lte": now}},
+                {"clear_owner": str(owner)},
+            ],
+        }
+        previous = await self.settings.find_one_and_update(
+            query,
+            {
+                "$set": {
+                    "owner": str(owner),
+                    "lease_until": now + timedelta(seconds=int(lease_seconds)),
+                    "clearing": True,
+                    "clear_owner": str(owner),
+                    "clear_lease_until": now + timedelta(seconds=int(lease_seconds)),
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.BEFORE,
+        )
+        if previous:
+            return previous
+        try:
+            await self.settings.insert_one({
+                "_id": "global_rename_queue_lease",
+                "owner": str(owner),
+                "lease_until": now + timedelta(seconds=int(lease_seconds)),
+                "clearing": True,
+                "clear_owner": str(owner),
+                "clear_lease_until": now + timedelta(seconds=int(lease_seconds)),
+                "updated_at": now,
+            })
+            return {}
+        except DuplicateKeyError:
+            return None
+
+    async def end_queue_clear(self, owner: str) -> bool:
+        now = datetime.now(timezone.utc)
+        result = await self.settings.update_one(
+            {
+                "_id": "global_rename_queue_lease",
+                "clear_owner": str(owner),
+                "clearing": True,
+            },
+            {
+                "$set": {
+                    "clearing": False,
+                    "lease_until": now,
+                    "clear_lease_until": now,
+                    "updated_at": now,
+                },
+                "$unset": {"clear_owner": ""},
+            },
+        )
+        return result.modified_count == 1
 
     async def release_queue_lease(self, owner: str) -> bool:
         now = datetime.now(timezone.utc)
