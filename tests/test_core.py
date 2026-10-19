@@ -867,16 +867,17 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
             contexts[message_id] = runtime._register_output_waiter(job)
             outputs[message_id] = SimpleNamespace(
                 id=200 + message_id,
+                chat=SimpleNamespace(id=999),
                 video=SimpleNamespace(file_name=expected, duration=120, width=1920, height=1080),
                 document=None,
                 caption=f"Renamed {quality}p",
                 reply_to_message_id=100 + message_id,
             )
 
-        upload_calls = []
+        copy_calls = []
 
-        async def fake_publish(final_message, output_id, thumbnail, expected_filename, *, caption):
-            upload_calls.append((final_message.id, output_id, expected_filename, caption))
+        async def fake_publish(final_message, output_id):
+            copy_calls.append((output_id, final_message.chat.id, final_message.id))
             return SimpleNamespace(id=9000 + final_message.id)
 
         with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()), patch(
@@ -895,19 +896,8 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(begin_publish.await_count, 3)
         self.assertEqual(publish.await_count, 3)
-        self.assertEqual(len(upload_calls), 3)
-        self.assertEqual({call[0] for call in upload_calls}, {201, 202, 203})
-        self.assertEqual({call[1] for call in upload_calls}, {900})
-        self.assertEqual({call[2] for call in upload_calls}, {
-            "[@tag] S1 Ep4 480p.mkv",
-            "[@tag] S1 Ep4 1080p.mkv",
-            "[@tag] S1 Ep4 720p.mkv",
-        })
-        self.assertEqual({call[3] for call in upload_calls}, {
-            "Episode 4, 480p",
-            "Episode 4, 1080p",
-            "Episode 4, 720p",
-        })
+        self.assertEqual(len(copy_calls), 3)
+        self.assertEqual(set(copy_calls), {(900, 999, 201), (900, 999, 202), (900, 999, 203)})
 
     async def test_metadata_matching_accepts_separator_and_username_suffix_variants(self):
         runtime = RenameRuntime()
@@ -1138,115 +1128,63 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VideoPublicationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_video_is_uploaded_once_with_original_metadata_and_no_forward(self):
+    async def test_renamed_video_is_server_copied_by_exact_chat_and_message_ids(self):
         runtime = RenameRuntime()
-        payload = b"video bytes including audio and quality data"
-        captured = {}
-
-        async def download(file_name):
-            with open(file_name, "wb") as handle:
-                handle.write(payload)
-            return file_name
-
-        async def send_video(chat_id, video_path, **kwargs):
-            with open(video_path, "rb") as handle:
-                captured["bytes"] = handle.read()
-            captured["chat_id"] = chat_id
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(id=987)
-
-        caption_entities = [SimpleNamespace(type="bold", offset=0, length=7)]
         final_message = SimpleNamespace(
-            video=SimpleNamespace(
-                file_name="original.mp4",
-                duration=125,
-                width=1920,
-                height=1080,
-                supports_streaming=True,
-            ),
+            id=555,
+            chat=SimpleNamespace(id=999),
+            video=SimpleNamespace(file_name="renamed S01E02 1080p.mp4"),
             document=None,
             caption="S01E02 | 1080p | AAC",
-            caption_entities=caption_entities,
-            has_media_spoiler=False,
-            download=AsyncMock(side_effect=download),
-            copy=AsyncMock(),
+            download=AsyncMock(side_effect=AssertionError("must not download")),
+            download_media=AsyncMock(side_effect=AssertionError("must not download")),
         )
         runtime.user_client = SimpleNamespace(
-            send_video=AsyncMock(side_effect=send_video),
-            send_document=AsyncMock(),
+            copy_message=AsyncMock(return_value=SimpleNamespace(id=987)),
+            send_video=AsyncMock(side_effect=AssertionError("must not re-upload")),
+            send_document=AsyncMock(side_effect=AssertionError("must not re-upload")),
         )
 
-        result = await runtime._publish_result(
-            final_message,
-            -100202,
-            b"normalized-thumbnail",
-            "renamed @tag.mp4",
-        )
+        copied = await runtime._publish_result(final_message, -100202)
 
-        self.assertEqual(result.id, 987)
-        self.assertEqual(captured["bytes"], payload)
-        self.assertEqual(captured["chat_id"], -100202)
-        self.assertEqual(runtime.user_client.send_video.await_count, 1)
-        runtime.user_client.send_document.assert_not_awaited()
-        final_message.copy.assert_not_awaited()
-        options = captured["kwargs"]
-        self.assertEqual(options["file_name"], "renamed @tag.mp4")
-        self.assertEqual(options["caption"], "S01E02 | 1080p | AAC")
-        self.assertIs(options["caption_entities"], caption_entities)
-        self.assertEqual((options["duration"], options["width"], options["height"]), (125, 1920, 1080))
-        self.assertTrue(options["supports_streaming"])
-        self.assertEqual(options["thumb"].getvalue(), b"normalized-thumbnail")
-
-    async def test_video_upload_failure_does_not_forward_or_retry_as_copy(self):
-        runtime = RenameRuntime()
-
-        async def download(file_name):
-            with open(file_name, "wb") as handle:
-                handle.write(b"video bytes")
-            return file_name
-
-        final_message = SimpleNamespace(
-            video=SimpleNamespace(file_name="original.mp4", duration=1, width=1, height=1),
-            document=None,
-            caption="",
-            caption_entities=None,
-            has_media_spoiler=False,
-            download=AsyncMock(side_effect=download),
-            copy=AsyncMock(),
-        )
-        runtime.user_client = SimpleNamespace(
-            send_video=AsyncMock(side_effect=RuntimeError("upload failed")),
-            send_document=AsyncMock(),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "upload failed"):
-            await runtime._publish_result(final_message, -100202, b"thumbnail", "renamed.mp4")
-
-        runtime.user_client.send_video.assert_awaited_once()
-        runtime.user_client.send_document.assert_not_awaited()
-        final_message.copy.assert_not_awaited()
-
-    async def test_non_video_document_uses_send_document(self):
-        runtime = RenameRuntime()
-
-        async def download(file_name):
-            with open(file_name, "wb") as handle:
-                handle.write(b"document bytes")
-            return file_name
-
-        final_message = SimpleNamespace(
-            video=None,
-            document=SimpleNamespace(file_name="result.pdf", mime_type="application/pdf"),
-            caption="Episode notes",
-            caption_entities=None,
-            download=AsyncMock(side_effect=download),
-            copy=AsyncMock(),
-        )
-        runtime.user_client = SimpleNamespace(send_video=AsyncMock(), send_document=AsyncMock(return_value=SimpleNamespace(id=321)))
-        result = await runtime._publish_result(final_message, -100202, b"thumb", "result.pdf")
-        self.assertEqual(result.id, 321)
-        runtime.user_client.send_document.assert_awaited_once()
+        self.assertEqual(copied.id, 987)
+        runtime.user_client.copy_message.assert_awaited_once_with(-100202, 999, 555)
+        final_message.download.assert_not_awaited()
+        final_message.download_media.assert_not_awaited()
         runtime.user_client.send_video.assert_not_awaited()
+        runtime.user_client.send_document.assert_not_awaited()
+
+    async def test_renamed_document_is_server_copied_and_copy_errors_have_no_upload_fallback(self):
+        runtime = RenameRuntime()
+        final_message = SimpleNamespace(
+            id=556,
+            chat=SimpleNamespace(id=999),
+            video=None,
+            document=SimpleNamespace(file_name="renamed.pdf"),
+            caption="Related document",
+            download=AsyncMock(side_effect=AssertionError("must not download")),
+        )
+        runtime.user_client = SimpleNamespace(
+            copy_message=AsyncMock(side_effect=RuntimeError("FILE_REFERENCE_EXPIRED: copy rejected")),
+            send_video=AsyncMock(side_effect=AssertionError("must not re-upload")),
+            send_document=AsyncMock(side_effect=AssertionError("must not re-upload")),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "FILE_REFERENCE_EXPIRED: copy rejected"):
+            await runtime._publish_result(final_message, -100202)
+
+        runtime.user_client.copy_message.assert_awaited_once_with(-100202, 999, 556)
+        final_message.download.assert_not_awaited()
+        runtime.user_client.send_video.assert_not_awaited()
+        runtime.user_client.send_document.assert_not_awaited()
+
+    async def test_copy_requires_actual_rename_result_source_identifiers(self):
+        runtime = RenameRuntime()
+        final_message = SimpleNamespace(video=SimpleNamespace(), document=None, id=1, chat=None)
+        runtime.user_client = SimpleNamespace(copy_message=AsyncMock())
+        with self.assertRaisesRegex(RuntimeError, "missing its source chat ID or message ID"):
+            await runtime._publish_result(final_message, -100202)
+        runtime.user_client.copy_message.assert_not_awaited()
 
 
 class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
@@ -1303,10 +1241,10 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(delivered)
         self.assertIs(context["future"].result(), media)
         publish.assert_awaited_once()
-        self.assertEqual(publish.await_args.args[:4], (media, 900, b"thumb", "standardized-name.mkv"))
+        self.assertEqual(publish.await_args.args, (media, 900))
         self.assertTrue(any(call.kwargs.get("status") == "completed" for call in update_job.await_args_list))
 
-    async def test_job_is_completed_only_after_output_upload_succeeds(self):
+    async def test_job_is_completed_only_after_server_side_copy_succeeds(self):
         runtime = RenameRuntime()
         job = {"source_channel_id": 100, "source_message_id": 7, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4", "original_caption": "source caption"}
         context = runtime._register_output_waiter(job)
@@ -1320,7 +1258,7 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         async def publish(*_args, **_kwargs):
-            events.append(("upload",))
+            events.append(("copy",))
             return uploaded
 
         async def update(source_id, message_id, **fields):
@@ -1331,15 +1269,15 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
         ) as update_job, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=publish)) as publish_result:
             await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
 
-        self.assertEqual([event[0] for event in events], ["begin", "upload", "update"])
+        self.assertEqual([event[0] for event in events], ["begin", "copy", "update"])
         self.assertEqual(events[-1], ("update", "completed"))
         self.assertEqual(update_job.await_args.kwargs["output_message_id"], 901)
         self.assertEqual(update_job.await_args.kwargs["destination_message_id"], 901)
         self.assertEqual(update_job.await_args.kwargs["rename_bot_output_message_id"], 501)
         self.assertEqual(update_job.await_args.kwargs["publication_status"], "published")
-        publish_result.assert_awaited_once_with(final, 900, b"thumb", "episode.mp4", caption="source caption")
+        publish_result.assert_awaited_once_with(final, 900)
 
-    async def test_upload_failure_is_logged_and_job_stays_uncompleted(self):
+    async def test_copy_failure_keeps_job_recoverable_without_rename_resubmission(self):
         runtime = RenameRuntime()
         job = {"source_channel_id": 100, "source_message_id": 8, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4"}
         context = runtime._register_output_waiter(job)
@@ -1348,9 +1286,10 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
             "plugins.rename_runtime.db.update_job", new=AsyncMock()
         ) as update_job, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=RuntimeError("output permission denied"))):
             await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
-        self.assertEqual(update_job.await_args.kwargs["status"], "failed")
-        self.assertEqual(update_job.await_args.kwargs["publication_status"], "failed")
-        self.assertEqual(update_job.await_args.kwargs["stage"], "publishing")
+        self.assertEqual(update_job.await_args.kwargs["status"], "submitted")
+        self.assertEqual(update_job.await_args.kwargs["submission_status"], "submitted")
+        self.assertEqual(update_job.await_args.kwargs["publication_status"], "pending")
+        self.assertEqual(update_job.await_args.kwargs["stage"], "copy_retry")
         self.assertIn("output permission denied", update_job.await_args.kwargs["error"])
 
     async def test_media_timeout_keeps_waiter_alive_for_late_output(self):
@@ -1580,6 +1519,9 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[2].args[0]["stage"]["$nin"], ["preflight", "callback_submitting", "callback_unknown"])
         self.assertEqual(calls[2].args[1]["$set"]["status"], "failed")
         self.assertEqual(calls[3].args[0], {"status": "publishing"})
+        self.assertEqual(calls[3].args[1]["$set"]["status"], "submitted")
+        self.assertEqual(calls[3].args[1]["$set"]["stage"], "copy_retry")
+        self.assertEqual(calls[3].args[1]["$set"]["publication_status"], "pending")
         self.assertEqual(calls[4].args[0]["workflow_version"], {"$ne": 3})
         self.assertEqual(calls[4].args[0]["attempts"]["$gt"], 0)
         self.assertEqual(calls[5].args[0], {"status": "submitting", "workflow_version": {"$ne": 3}})
