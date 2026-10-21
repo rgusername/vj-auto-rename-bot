@@ -11,7 +11,7 @@ from pyrogram import enums
 from pyrogram.errors import BotResponseTimeout
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from plugins.commands import _normalize_thumbnail, clear_queue as clear_queue_command
+from plugins.commands import _normalize_thumbnail, clear_queue as clear_queue_command, set_output_caption
 from config import DB_NAME
 from plugins.database import Database
 from plugins.filename_utils import (
@@ -92,6 +92,40 @@ class FilenameTests(unittest.TestCase):
         )
 
 
+class CaptionTemplateTests(unittest.TestCase):
+    def test_caption_template_substitutes_metadata_and_preserves_lines_and_spacing(self):
+        template = (
+            "Tokyo Ghoul √A [$season]\n"
+            "[ $episode] Hindi #Official\n"
+            "• Quality: $quality\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Join Our channel's\n"
+            "@Dub_Anime_in_Hindi"
+        )
+        metadata = extract_video_metadata("Tokyo.Ghoul.S02E12.480p.mkv")
+        self.assertEqual(
+            RenameRuntime._render_caption_template(template, metadata),
+            "Tokyo Ghoul √A [S02]\n"
+            "[ Ep12 ] Hindi #Official\n"
+            "• Quality: 480p\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Join Our channel's\n"
+            "@Dub_Anime_in_Hindi",
+        )
+
+    def test_missing_metadata_replaces_placeholders_with_empty_strings(self):
+        template = "Season=$season; Episode=$episode; Quality=$quality\nKeep  two spaces"
+        self.assertEqual(
+            RenameRuntime._render_caption_template(template, {}),
+            "Season=; Episode=; Quality=\nKeep  two spaces",
+        )
+
+    def test_caption_limit_uses_utf16_length_and_fails_without_truncating(self):
+        self.assertEqual(RenameRuntime._render_caption_template("😀" * 512, {}), "😀" * 512)
+        with self.assertRaisesRegex(ValueError, "at most 1024"):
+            RenameRuntime._render_caption_template("😀" * 513, {})
+
+
 class ThumbnailTests(unittest.TestCase):
     def test_thumbnail_is_small_jpeg_with_telegram_safe_dimensions(self):
         source = io.BytesIO()
@@ -151,6 +185,45 @@ class ClearCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Persistent non-completed jobs removed: <b>4</b>", response)
         self.assertIn("Stale in-memory queue entries removed: <b>3</b>", response)
         self.assertIn("could not be safely cancelled", response)
+
+
+class CaptionCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_set_caption_is_admin_only_and_saves_template_for_valid_output(self):
+        reply_text = AsyncMock()
+        message = SimpleNamespace(reply_text=reply_text, text="/setCaption -100202", from_user=SimpleNamespace(id=123), chat=SimpleNamespace(id=123))
+        client = SimpleNamespace()
+        with patch("plugins.commands._require_admin", new=AsyncMock(return_value=False)), patch(
+            "plugins.commands.db.list_channel_configs", new=AsyncMock()
+        ) as list_configs:
+            await set_output_caption(client, message)
+        list_configs.assert_not_awaited()
+
+        template = "Tokyo Ghoul √A [$season]\n[ $episode] Hindi #Official\n• Quality: $quality\n━━━━━━━━━━\nJoin Our channel's\n@Dub_Anime_in_Hindi"
+        template_message = SimpleNamespace(text=template, reply_text=AsyncMock())
+        client.listen = AsyncMock(return_value=template_message)
+        with patch("plugins.commands._require_admin", new=AsyncMock(return_value=True)), patch(
+            "plugins.commands.db.list_channel_configs", new=AsyncMock(return_value=[{"output_channel_id": -100202}])
+        ), patch("plugins.commands.db.set_output_caption", new=AsyncMock()) as save, patch(
+            "plugins.commands.rename_runtime.resume_pending_jobs", new=AsyncMock()
+        ) as resume:
+            await set_output_caption(client, message)
+        save.assert_awaited_once_with(-100202, template)
+        resume.assert_awaited_once_with()
+        self.assertIn("saved for output channel", template_message.reply_text.await_args.args[0])
+
+    async def test_set_caption_rejects_unconfigured_destination(self):
+        message = SimpleNamespace(
+            reply_text=AsyncMock(),
+            text="/setCaption -100999",
+            from_user=SimpleNamespace(id=123),
+            chat=SimpleNamespace(id=123),
+        )
+        with patch("plugins.commands._require_admin", new=AsyncMock(return_value=True)), patch(
+            "plugins.commands.db.list_channel_configs", new=AsyncMock(return_value=[])
+        ), patch("plugins.commands.db.set_output_caption", new=AsyncMock()) as save:
+            await set_output_caption(SimpleNamespace(), message)
+        save.assert_not_awaited()
+        self.assertIn("not configured", message.reply_text.await_args.args[0])
 
 
 class RuntimeSessionReuseTests(unittest.IsolatedAsyncioTestCase):
@@ -881,6 +954,8 @@ class SharedQueueTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(id=9000 + final_message.id)
 
         with patch("plugins.rename_runtime.db.update_job", new=AsyncMock()), patch(
+            "plugins.rename_runtime.db.get_output_caption", new=AsyncMock(return_value=None)
+        ), patch(
             "plugins.rename_runtime.db.begin_output_publish", new=AsyncMock(return_value=True)
         ) as begin_publish, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=fake_publish)) as publish:
             for message_id in (3, 1, 2):
@@ -1188,6 +1263,13 @@ class VideoPublicationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.caption_patch = patch("plugins.rename_runtime.db.get_output_caption", new=AsyncMock(return_value=None))
+        self.caption_patch.start()
+
+    async def asyncTearDown(self):
+        self.caption_patch.stop()
+
     async def test_history_poll_recovers_post_submission_media_missed_by_handler(self):
         runtime = RenameRuntime()
         runtime.rename_bot_id = 999
@@ -1244,14 +1326,21 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(publish.await_args.args, (media, 900))
         self.assertTrue(any(call.kwargs.get("status") == "completed" for call in update_job.await_args_list))
 
-    async def test_job_is_completed_only_after_server_side_copy_succeeds(self):
+    async def test_copy_then_caption_edit_then_completion_happens_in_order(self):
         runtime = RenameRuntime()
-        job = {"source_channel_id": 100, "source_message_id": 7, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4", "original_caption": "source caption"}
+        job = {
+            "source_channel_id": 100,
+            "source_message_id": 7,
+            "output_channel_id": 900,
+            "status": "submitted",
+            "expected_filename": "episode.mp4",
+            "media_metadata": {"season": 2, "episode": 12, "quality": 480},
+        }
         context = runtime._register_output_waiter(job)
-        final = SimpleNamespace(id=501)
+        final = SimpleNamespace(id=501, chat=SimpleNamespace(id=999))
         context["future"].set_result(final)
         events = []
-        uploaded = SimpleNamespace(id=901)
+        copied = SimpleNamespace(id=901)
 
         async def begin(source_id, message_id, output_message_id):
             events.append(("begin", source_id, message_id, output_message_id))
@@ -1259,38 +1348,130 @@ class OutputTrackingTests(unittest.IsolatedAsyncioTestCase):
 
         async def publish(*_args, **_kwargs):
             events.append(("copy",))
-            return uploaded
+            return copied
+
+        async def edit_caption(chat_id, message_id, caption):
+            events.append(("edit", chat_id, message_id, caption))
+            return True
 
         async def update(source_id, message_id, **fields):
-            events.append(("update", fields["status"]))
+            events.append(("update", fields["status"], fields.get("stage"), fields.get("destination_message_id")))
 
         with patch("plugins.rename_runtime.db.begin_output_publish", new=AsyncMock(side_effect=begin)), patch(
             "plugins.rename_runtime.db.update_job", new=AsyncMock(side_effect=update)
-        ) as update_job, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=publish)) as publish_result:
+        ) as update_job, patch("plugins.rename_runtime.db.get_output_caption", new=AsyncMock(return_value="S=$season E=$episode Q=$quality")), patch.object(
+            runtime, "user_client", SimpleNamespace(edit_message_caption=AsyncMock(side_effect=edit_caption))
+        ), patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=publish)) as publish_result:
             await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
 
-        self.assertEqual([event[0] for event in events], ["begin", "copy", "update"])
-        self.assertEqual(events[-1], ("update", "completed"))
+        self.assertEqual([event[0] for event in events], ["begin", "copy", "update", "edit", "update"])
+        self.assertEqual(events[2], ("update", "submitted", "caption_edit_retry", 901))
+        self.assertEqual(events[3], ("edit", 900, 901, "S=S02 E=Ep12 Q=480p"))
+        self.assertEqual(events[-1][1], "completed")
         self.assertEqual(update_job.await_args.kwargs["output_message_id"], 901)
         self.assertEqual(update_job.await_args.kwargs["destination_message_id"], 901)
-        self.assertEqual(update_job.await_args.kwargs["rename_bot_output_message_id"], 501)
         self.assertEqual(update_job.await_args.kwargs["publication_status"], "published")
         publish_result.assert_awaited_once_with(final, 900)
 
-    async def test_copy_failure_keeps_job_recoverable_without_rename_resubmission(self):
+    async def test_copy_failure_skips_caption_edit_and_persists_error(self):
         runtime = RenameRuntime()
         job = {"source_channel_id": 100, "source_message_id": 8, "output_channel_id": 900, "status": "submitted", "expected_filename": "episode.mp4"}
         context = runtime._register_output_waiter(job)
-        context["future"].set_result(SimpleNamespace(id=502))
+        context["future"].set_result(SimpleNamespace(id=502, chat=SimpleNamespace(id=999)))
+        runtime.user_client = SimpleNamespace(edit_message_caption=AsyncMock())
         with patch("plugins.rename_runtime.db.begin_output_publish", new=AsyncMock(return_value=True)), patch(
             "plugins.rename_runtime.db.update_job", new=AsyncMock()
         ) as update_job, patch.object(runtime, "_publish_result", new=AsyncMock(side_effect=RuntimeError("output permission denied"))):
             await runtime._track_submitted_output(job, {"thumbnail": b"thumb"}, context)
-        self.assertEqual(update_job.await_args.kwargs["status"], "submitted")
-        self.assertEqual(update_job.await_args.kwargs["submission_status"], "submitted")
-        self.assertEqual(update_job.await_args.kwargs["publication_status"], "pending")
-        self.assertEqual(update_job.await_args.kwargs["stage"], "copy_retry")
+        self.assertEqual(update_job.await_args.kwargs["status"], "failed")
+        self.assertEqual(update_job.await_args.kwargs["publication_status"], "copy_failed")
+        self.assertEqual(update_job.await_args.kwargs["stage"], "copy_failed")
         self.assertIn("output permission denied", update_job.await_args.kwargs["error"])
+        self.assertEqual(update_job.await_args.kwargs["rename_bot_output_message_id"], 502)
+        runtime.user_client.edit_message_caption.assert_not_awaited()
+
+    async def test_caption_edit_failure_is_recovered_without_a_second_copy(self):
+        runtime = RenameRuntime()
+        persisted = {
+            "source_channel_id": 100,
+            "source_message_id": 18,
+            "output_channel_id": 900,
+            "status": "submitted",
+            "stage": "caption_edit_retry",
+            "destination_message_id": 901,
+            "output_message_id": 901,
+            "rename_bot_output_message_id": 501,
+            "media_metadata": {"season": 2, "episode": 12, "quality": 480},
+        }
+        edit_caption = AsyncMock(side_effect=RuntimeError("caption edit denied"))
+        runtime.user_client = SimpleNamespace(
+            edit_message_caption=edit_caption,
+            copy_message=AsyncMock(side_effect=AssertionError("must not copy twice")),
+        )
+
+        async def update(_source, _message, **fields):
+            persisted.update(fields)
+
+        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(side_effect=lambda *_args: dict(persisted))), patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"output_channel_id": 900})
+        ), patch("plugins.rename_runtime.db.get_output_caption", new=AsyncMock(return_value="S=$season Ep=$episode $quality")), patch(
+            "plugins.rename_runtime.db.update_job", new=AsyncMock(side_effect=update)
+        ), patch.object(runtime, "_publish_result", new=AsyncMock()) as copy_result:
+            self.assertFalse(await runtime._process_job(100, 18))
+            self.assertEqual(persisted["status"], "submitted")
+            self.assertEqual(persisted["stage"], "caption_edit_retry")
+            self.assertEqual(persisted["destination_message_id"], 901)
+            self.assertIn("caption edit denied", persisted["error"])
+
+            edit_caption.side_effect = None
+            self.assertTrue(await runtime._process_job(100, 18))
+
+        self.assertEqual(edit_caption.await_count, 2)
+        self.assertEqual(edit_caption.await_args_list[0].args, (900, 901, "S=S02 Ep=Ep12 480p"))
+        self.assertEqual(edit_caption.await_args_list[1].args, (900, 901, "S=S02 Ep=Ep12 480p"))
+        runtime.user_client.copy_message.assert_not_awaited()
+        copy_result.assert_not_awaited()
+        self.assertEqual(persisted["status"], "completed")
+
+    async def test_session_stop_during_caption_edit_preserves_output_only_retry(self):
+        runtime = RenameRuntime()
+        persisted = {
+            "source_channel_id": 100,
+            "source_message_id": 19,
+            "output_channel_id": 900,
+            "status": "submitted",
+            "stage": "caption_edit_retry",
+            "destination_message_id": 902,
+            "output_message_id": 902,
+            "rename_bot_output_message_id": 502,
+            "media_metadata": {"episode": 14},
+        }
+        entered_edit = asyncio.Event()
+        never_finish = asyncio.Event()
+
+        async def edit_caption(*_args):
+            entered_edit.set()
+            await never_finish.wait()
+
+        runtime.user_client = SimpleNamespace(edit_message_caption=AsyncMock(side_effect=edit_caption))
+        with patch("plugins.rename_runtime.db.get_job", new=AsyncMock(return_value=persisted)), patch(
+            "plugins.rename_runtime.db.get_channel_config", new=AsyncMock(return_value={"output_channel_id": 900})
+        ), patch("plugins.rename_runtime.db.get_output_caption", new=AsyncMock(return_value="Ep $episode")), patch(
+            "plugins.rename_runtime.db.update_job", new=AsyncMock()
+        ) as update_job:
+            task = asyncio.create_task(runtime._process_job(100, 19))
+            await asyncio.wait_for(entered_edit.wait(), timeout=1)
+            runtime._stopping_session = True
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        runtime._stopping_session = False
+
+        fields = update_job.await_args.kwargs
+        self.assertEqual(fields["status"], "submitted")
+        self.assertEqual(fields["stage"], "caption_edit_retry")
+        self.assertIn("without copying again", fields["error"])
+        self.assertEqual(persisted["destination_message_id"], 902)
 
     async def test_media_timeout_keeps_waiter_alive_for_late_output(self):
         runtime = RenameRuntime()
@@ -1437,6 +1618,29 @@ class DatabaseMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(configs.update_one.await_args_list[0].args[1]["$set"]["channel_number"], 1)
         self.assertEqual(configs.update_one.await_args_list[1].args[1]["$set"]["channel_number"], 2)
 
+    async def test_output_caption_templates_are_persisted_separately_per_destination(self):
+        stored = {}
+
+        async def update_one(query, update, *, upsert):
+            self.assertTrue(upsert)
+            stored[query["_id"]] = {
+                "output_channel_id": update["$set"]["output_channel_id"],
+                "value": update["$set"]["value"],
+            }
+
+        async def find_one(query):
+            return stored.get(query["_id"])
+
+        database = Database.__new__(Database)
+        database.settings = SimpleNamespace(update_one=AsyncMock(side_effect=update_one), find_one=AsyncMock(side_effect=find_one))
+        first = "line one\n  line two  "
+        second = "other channel\n$episode"
+        await database.set_output_caption(-1001, first)
+        await database.set_output_caption(-1002, second)
+        self.assertEqual(await database.get_output_caption(-1001), first)
+        self.assertEqual(await database.get_output_caption(-1002), second)
+        self.assertEqual(set(stored), {"output_caption:-1001", "output_caption:-1002"})
+
 
 class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_clear_queue_deletes_only_noncompleted_jobs_from_jobs_collection(self):
@@ -1510,7 +1714,7 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         database = Database.__new__(Database)
         database.jobs = SimpleNamespace(update_many=AsyncMock())
         await database.recover_interrupted_jobs(max_attempts=3)
-        self.assertEqual(database.jobs.update_many.await_count, 7)
+        self.assertEqual(database.jobs.update_many.await_count, 8)
         calls = database.jobs.update_many.await_args_list
         self.assertEqual(calls[0].args[0], {"status": "submitting", "workflow_version": 3, "stage": "preflight"})
         self.assertEqual(calls[0].args[1]["$set"]["status"], "pending")
@@ -1518,15 +1722,18 @@ class DatabaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1].args[1]["$set"]["status"], "submission_unknown")
         self.assertEqual(calls[2].args[0]["stage"]["$nin"], ["preflight", "callback_submitting", "callback_unknown"])
         self.assertEqual(calls[2].args[1]["$set"]["status"], "failed")
-        self.assertEqual(calls[3].args[0], {"status": "publishing"})
+        self.assertEqual(calls[3].args[0], {"status": "publishing", "destination_message_id": {"$type": "number"}})
         self.assertEqual(calls[3].args[1]["$set"]["status"], "submitted")
-        self.assertEqual(calls[3].args[1]["$set"]["stage"], "copy_retry")
-        self.assertEqual(calls[3].args[1]["$set"]["publication_status"], "pending")
-        self.assertEqual(calls[4].args[0]["workflow_version"], {"$ne": 3})
-        self.assertEqual(calls[4].args[0]["attempts"]["$gt"], 0)
-        self.assertEqual(calls[5].args[0], {"status": "submitting", "workflow_version": {"$ne": 3}})
-        self.assertEqual(calls[6].args[0]["stage"], "preflight")
-        self.assertEqual(calls[6].args[0]["attempts"]["$lt"], 3)
+        self.assertEqual(calls[3].args[1]["$set"]["stage"], "caption_edit_retry")
+        self.assertEqual(calls[3].args[1]["$set"]["publication_status"], "caption_edit_retry")
+        self.assertEqual(calls[4].args[0], {"status": "publishing"})
+        self.assertEqual(calls[4].args[1]["$set"]["status"], "failed")
+        self.assertEqual(calls[4].args[1]["$set"]["stage"], "copy_uncertain")
+        self.assertEqual(calls[5].args[0]["workflow_version"], {"$ne": 3})
+        self.assertEqual(calls[5].args[0]["attempts"]["$gt"], 0)
+        self.assertEqual(calls[6].args[0], {"status": "submitting", "workflow_version": {"$ne": 3}})
+        self.assertEqual(calls[7].args[0]["stage"], "preflight")
+        self.assertEqual(calls[7].args[0]["attempts"]["$lt"], 3)
 
     async def test_submitted_output_jobs_are_loaded_without_requeueing(self):
         database = Database.__new__(Database)
