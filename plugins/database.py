@@ -173,6 +173,24 @@ class Database:
         record = await self.settings.find_one({"_id": "filename_username"})
         return str(record.get("value", "")) if record else ""
 
+    async def set_output_caption(self, output_channel_id: int, template: str):
+        """Persist an output caption template independently for each destination channel."""
+        await self.settings.update_one(
+            {"_id": f"output_caption:{int(output_channel_id)}"},
+            {
+                "$set": {
+                    "output_channel_id": int(output_channel_id),
+                    "value": str(template),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+
+    async def get_output_caption(self, output_channel_id: int) -> str | None:
+        record = await self.settings.find_one({"_id": f"output_caption:{int(output_channel_id)}"})
+        return str(record["value"]) if record and "value" in record else None
+
     async def create_job(
         self,
         source_id: int,
@@ -494,10 +512,12 @@ class Database:
             {"$set": {"status": "failed", "submission_status": "failed", "error": "Interrupted during submission; not restarted to prevent duplicate rename/callback actions.", "updated_at": datetime.now(timezone.utc)}},
         )
         await self.jobs.update_many(
-            {
-                "status": "publishing",
-            },
-            {"$set": {"status": "submitted", "submission_status": "submitted", "publication_status": "pending", "stage": "copy_retry", "error": "Interrupted during server-side result copy; output-only recovery will retry the stored rename-bot message without resubmitting the rename workflow.", "updated_at": datetime.now(timezone.utc)}},
+            {"status": "publishing", "destination_message_id": {"$type": "number"}},
+            {"$set": {"status": "submitted", "submission_status": "submitted", "publication_status": "caption_edit_retry", "stage": "caption_edit_retry", "error": "Restarted after Telegram copy succeeded; resume caption editing on the stored destination message without copying again.", "updated_at": datetime.now(timezone.utc)}},
+        )
+        await self.jobs.update_many(
+            {"status": "publishing"},
+            {"$set": {"status": "failed", "publication_status": "copy_uncertain", "stage": "copy_uncertain", "error": "Restarted during Telegram message copy without a persisted destination message ID; not copied again to avoid duplicate delivery.", "updated_at": datetime.now(timezone.utc)}},
         )
         # Older records have no separate submission/output checkpoints. An attempted
         # legacy workflow is fenced instead of blindly restarting its callback.
