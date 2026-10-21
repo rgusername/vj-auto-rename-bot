@@ -55,7 +55,7 @@ async def start_message(client, message):
     await message.reply_text(
         "<b>VJ Auto Rename Bot</b>\n\n"
         "Use /login to connect the Telegram user account that can read your source channels. "
-        "Administrators can configure mappings with /set and a suffix with /setusername."
+        "Administrators can configure mappings with /set, output captions with /setCaption, and a filename suffix with /setusername."
     )
 
 
@@ -154,6 +154,65 @@ async def set_channel(client, message):
             listener_task.cancel()
             await asyncio.gather(listener_task, return_exceptions=True)
         _pending_config_users.discard(message.from_user.id)
+
+
+@Client.on_message(filters.command("setCaption") & filters.private)
+async def set_output_caption(client, message):
+    if not await _require_admin(message):
+        return
+    if not message.from_user:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        return await message.reply_text("Usage: <code>/setCaption OUTPUT_CHANNEL_ID</code>")
+    try:
+        output_id = int(parts[1])
+        if output_id >= 0:
+            raise ValueError
+    except ValueError:
+        return await message.reply_text("Provide a valid negative Telegram output channel ID, usually beginning with <code>-100</code>.")
+
+    try:
+        mappings = await db.list_channel_configs()
+        if not any(int(item.get("output_channel_id", 0)) == output_id for item in mappings):
+            return await message.reply_text("That output channel is not configured by any source mapping. Run <code>/set</code> first.")
+    except Exception:
+        logger.exception("Could not validate output channel before caption setup.")
+        return await message.reply_text("Database error: configured output channels could not be checked.")
+
+    admin_id = int(message.from_user.id)
+    listener_task = asyncio.create_task(client.listen(
+        message.chat.id,
+        filters=filters.text & filters.user(admin_id),
+        timeout=600,
+    ))
+    try:
+        await asyncio.sleep(0)
+        await message.reply_text(
+            f"Send the caption template for output channel <code>{output_id}</code>.\n"
+            "Available placeholders: <code>$season</code>, <code>$episode</code>, and <code>$quality</code>. "
+            "Line breaks and spacing will be preserved. Send /cancel to stop."
+        )
+        template_message = await listener_task
+        template = template_message.text or ""
+        first_token = template.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() if template.strip() else ""
+        if first_token == "/cancel":
+            await template_message.reply_text("Caption setup cancelled; the previously saved template was not changed.")
+            return
+        if not template.strip():
+            return await template_message.reply_text("The caption template cannot be empty. Run /setCaption again to try again.")
+        await db.set_output_caption(output_id, template)
+        await rename_runtime.resume_pending_jobs()
+        await template_message.reply_text(f"Caption template saved for output channel <code>{output_id}</code>.")
+    except asyncio.TimeoutError:
+        await message.reply_text("Timed out waiting for the caption template. The previously saved template was not changed.")
+    except Exception:
+        logger.exception("Could not persist output caption template for channel=%s", output_id)
+        await message.reply_text("Could not save the caption template. Please check database connectivity and try again.")
+    finally:
+        if not listener_task.done():
+            listener_task.cancel()
+            await asyncio.gather(listener_task, return_exceptions=True)
 
 
 @Client.on_message(filters.command("setusername") & filters.private)
