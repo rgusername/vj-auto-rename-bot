@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 _UNMATCHED_OUTPUT_MAX = 100
 _UNMATCHED_OUTPUT_TTL_SECONDS = 3600
 _OUTPUT_RECOVERY_POLL_SECONDS = 15
+_TELEGRAM_CAPTION_LIMIT = 1024
 
 
 
@@ -89,6 +90,31 @@ class RenameRuntime:
         self._unmatched_outputs: deque[dict] = deque()
         self._stopping_session = False
         self._handler_group = 70
+
+    @staticmethod
+    def _render_caption_template(template: str, metadata: dict | None) -> str:
+        """Substitute known media metadata while preserving template whitespace and line breaks."""
+        metadata = metadata or {}
+        season_value = metadata.get("season")
+        episode_value = metadata.get("episode")
+        quality_value = metadata.get("quality")
+        season = f"S{int(season_value):02d}" if season_value is not None else ""
+        episode = f"Ep{int(episode_value)}" if episode_value is not None else ""
+        quality = f"{int(quality_value)}p" if quality_value is not None else ""
+        rendered = str(template)
+        # Match the documented sample's bracket convention: a closing bracket
+        # immediately after $episode gets one separating space ("[ Ep12 ]").
+        if episode and "$episode]" in rendered:
+            rendered = rendered.replace("$episode]", f"{episode} ]")
+        rendered = rendered.replace("$season", season)
+        rendered = rendered.replace("$episode", episode)
+        rendered = rendered.replace("$quality", quality)
+        length = len(rendered.encode("utf-16-le")) // 2
+        if length > _TELEGRAM_CAPTION_LIMIT:
+            raise ValueError(
+                f"Rendered caption is {length} UTF-16 code units; Telegram allows at most {_TELEGRAM_CAPTION_LIMIT}."
+            )
+        return rendered
 
     @property
     def session_owner_id(self) -> int:
@@ -667,6 +693,91 @@ class RenameRuntime:
                 error_task.cancel()
             await asyncio.gather(error_task, return_exceptions=True)
 
+    async def _finalize_copied_output(self, job: dict, destination_message_id: int) -> bool:
+        """Edit the copied destination caption, then mark this FIFO job complete."""
+        source_id = int(job["source_channel_id"])
+        message_id = int(job["source_message_id"])
+        output_id = int(job["output_channel_id"])
+        rename_output_id = job.get("rename_bot_output_message_id")
+        try:
+            template = await db.get_output_caption(output_id)
+            if template is not None:
+                caption = self._render_caption_template(template, job.get("media_metadata"))
+                logger.info(
+                    "Editing copied output caption job=%s output_channel=%s destination_message=%s rename_bot_message=%s caption_length=%s",
+                    job.get("job_id") or f"{source_id}:{message_id}",
+                    output_id,
+                    destination_message_id,
+                    rename_output_id,
+                    len(caption.encode("utf-16-le")) // 2,
+                )
+                await self._bounded_flood_retry(
+                    self.user_client.edit_message_caption,
+                    output_id,
+                    int(destination_message_id),
+                    caption,
+                )
+                logger.info(
+                    "Caption edit succeeded job=%s output_channel=%s destination_message=%s",
+                    job.get("job_id") or f"{source_id}:{message_id}",
+                    output_id,
+                    destination_message_id,
+                )
+            else:
+                logger.info(
+                    "No caption template is configured for output_channel=%s; retaining copied rename-bot caption.",
+                    output_id,
+                )
+            await db.update_job(
+                source_id,
+                message_id,
+                status="completed",
+                publication_status="published",
+                stage="completed",
+                output_message_id=int(destination_message_id),
+                destination_message_id=int(destination_message_id),
+                error=None,
+                completed_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Caption edit/finalization failed job=%s output_channel=%s destination_message=%s; preserving copied message for edit-only recovery.",
+                job.get("job_id") or f"{source_id}:{message_id}",
+                output_id,
+                destination_message_id,
+            )
+            await db.update_job(
+                source_id,
+                message_id,
+                status="submitted",
+                submission_status="submitted",
+                publication_status="caption_edit_retry",
+                stage="caption_edit_retry",
+                output_message_id=int(destination_message_id),
+                destination_message_id=int(destination_message_id),
+                error=str(exc)[:1000],
+            )
+            return False
+
+        logger.info(
+            "Completed rename job=%s source=%s/%s output_channel=%s destination_message=%s",
+            job.get("job_id") or f"{source_id}:{message_id}",
+            source_id,
+            message_id,
+            output_id,
+            destination_message_id,
+        )
+        if self.bot_client and ADMINS:
+            try:
+                await self.bot_client.send_message(
+                    ADMINS[0],
+                    f"Rename complete: <code>{job.get('expected_filename') or 'renamed file'}</code>\n"
+                    f"Source: <code>{source_id}/{message_id}</code>",
+                )
+            except Exception:
+                logger.debug("Could not send job-completion notification to the primary administrator.", exc_info=True)
+        return True
+
     async def _track_submitted_output(self, job: dict, config: dict, context: dict):
         source_id, message_id = int(job["source_channel_id"]), int(job["source_message_id"])
         key = (source_id, message_id)
@@ -688,7 +799,7 @@ class RenameRuntime:
             expected_filename = context.get("expected_filename") or job.get("expected_filename") or job.get("final_filename") or self._media_filename(final_message)
             try:
                 logger.info(
-                    "Publishing matched rename-bot media job=%s source=%s/%s rename_bot_output=%s destination=%s filename=%s",
+                    "Copying matched rename-bot message job=%s source=%s/%s rename_bot_output=%s destination=%s filename=%s",
                     job_id,
                     source_id,
                     message_id,
@@ -699,7 +810,7 @@ class RenameRuntime:
                 copied_message = await self._publish_result(final_message, output_id)
             except Exception as exc:
                 logger.exception(
-                    "Server-side copy_message failed job=%s Channel %s source=%s message=%s destination=%s rename_bot_chat=%s rename_bot_message=%s; preserving the submitted job for output-only recovery.",
+                    "Server-side copy_message failed job=%s Channel %s source=%s message=%s destination=%s rename_bot_chat=%s rename_bot_message=%s; caption editing will not be attempted.",
                     job.get("job_id") or f"{source_id}:{message_id}",
                     job.get("source_channel_number", "?"),
                     source_id,
@@ -711,41 +822,37 @@ class RenameRuntime:
                 await db.update_job(
                     source_id,
                     message_id,
-                    status="submitted",
+                    status="failed",
                     submission_status="submitted",
-                    publication_status="pending",
-                    stage="copy_retry",
+                    publication_status="copy_failed",
+                    stage="copy_failed",
+                    rename_bot_output_message_id=int(final_message.id),
                     error=str(exc)[:1000],
                 )
                 return False
+            logger.info(
+                "Server-side copy succeeded job=%s rename_bot=%s/%s output=%s/%s",
+                job_id,
+                getattr(getattr(final_message, "chat", None), "id", None),
+                getattr(final_message, "id", None),
+                output_id,
+                copied_message.id,
+            )
             await db.update_job(
                 source_id,
                 message_id,
-                status="completed",
-                publication_status="published",
-                stage="completed",
-                output_message_id=copied_message.id,
-                destination_message_id=copied_message.id,
+                status="submitted",
+                submission_status="submitted",
+                publication_status="caption_edit_pending",
+                stage="caption_edit_retry",
+                output_message_id=int(copied_message.id),
+                destination_message_id=int(copied_message.id),
                 rename_bot_output_message_id=int(final_message.id),
                 error=None,
-                completed_at=datetime.now(timezone.utc),
             )
-            logger.info(
-                "Completed rename job=%s Channel %s source=%s message=%s output_channel=%s destination_message=%s filename=%s",
-                job.get("job_id") or f"{source_id}:{message_id}",
-                job.get("source_channel_number", "?"),
-                source_id,
-                message_id,
-                output_id,
-                copied_message.id,
-                expected_filename,
-            )
-            if self.bot_client and ADMINS:
-                try:
-                    await self.bot_client.send_message(ADMINS[0], f"Rename complete: <code>{expected_filename}</code>\nSource: <code>{source_id}/{message_id}</code>")
-                except Exception:
-                    logger.debug("Could not send job-completion notification to the primary administrator.", exc_info=True)
-            return True
+            job["rename_bot_output_message_id"] = int(final_message.id)
+            job["expected_filename"] = expected_filename
+            return await self._finalize_copied_output(job, int(copied_message.id))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1160,7 +1267,7 @@ class RenameRuntime:
                         "thumbnail_sending", "thumbnail_sent", "media_sending", "media_sent",
                         "filename_prompt_received", "filename_sending", "filename_submitted",
                         "menu_received", "callback_submitting", "callback_unknown", "submitted",
-                        "publishing",
+                        "publishing", "caption_edit_retry",
                     }
                     active_could_not_cancel = (
                         remote_worker_active
@@ -1580,6 +1687,15 @@ class RenameRuntime:
             if not config:
                 raise RuntimeError("Source-channel configuration was removed.")
             status = job.get("status")
+            copied_message_id = job.get("destination_message_id") or job.get("output_message_id")
+            if copied_message_id is not None:
+                logger.info(
+                    "Resuming caption-only recovery job=%s output_channel=%s destination_message=%s; no rename submission or copy will be repeated.",
+                    job.get("job_id") or f"{source_id}:{message_id}",
+                    job.get("output_channel_id"),
+                    copied_message_id,
+                )
+                return await self._finalize_copied_output(job, int(copied_message_id))
             if status == "pending":
                 if int(job.get("attempts", 0)) >= MAX_RENAME_ATTEMPTS:
                     await db.update_job(source_id, message_id, status="failed", submission_status="failed", error="Maximum processing attempts reached.")
@@ -1624,6 +1740,16 @@ class RenameRuntime:
             stage = current.get("stage") if current else None
             if stage == "preflight" and self._stopping_session:
                 await db.update_job(source_id, message_id, status="pending", submission_status="queued", stage="preflight", error="Session stopped before any rename-bot action; safe to resume.")
+            elif self._stopping_session and current and (current.get("destination_message_id") or current.get("output_message_id")):
+                await db.update_job(
+                    source_id,
+                    message_id,
+                    status="submitted",
+                    submission_status="submitted",
+                    publication_status="caption_edit_retry",
+                    stage="caption_edit_retry",
+                    error="Session stopped during caption editing; resume editing the persisted destination message without copying again.",
+                )
             elif stage in {"callback_submitting", "callback_unknown"} and key in self._output_waiters:
                 if self._stopping_session:
                     await db.update_job(source_id, message_id, status="submission_unknown", submission_status="submission_unknown", stage="callback_unknown", error="Session stopped during callback; output tracking will be restored without resubmission.")
